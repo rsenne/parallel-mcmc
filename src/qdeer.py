@@ -168,7 +168,8 @@ def diagonal_deer_iteration_helper(
 ) -> Tuple[jnp.ndarray, Optional[List[jnp.ndarray]], Callable]:
 
     precond = preconditioner if preconditioner is not None else jnp.ones((yinit_guess.shape[-1]))
-    keys = jr.split(params['key'], (xinput.shape[0]))
+    _T = jax.tree_util.tree_leaves(xinput)[0].shape[0]
+    keys = jr.split(params['key'], _T)
 
     def deer_jvp(z, driver, params, v):
         return jax.jvp(lambda z : dyn_func(z, driver, params), (z,), (v, ))
