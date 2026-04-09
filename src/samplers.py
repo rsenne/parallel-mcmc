@@ -9,8 +9,10 @@ from functools import partial
 import src
 from src import deer, qdeer, windowed_qdeer, elk
 
-from tensorflow_probability.substrates import jax as tfp
-tfd = tfp.distributions
+def _diag_mvn_logpdf(x, loc, scale_diag):
+    """Log-pdf of a diagonal multivariate normal (replaces tfp dependency)."""
+    d = x - loc
+    return -0.5 * jnp.sum(d**2 / scale_diag**2) - jnp.sum(jnp.log(scale_diag)) - 0.5 * x.shape[0] * jnp.log(2 * jnp.pi)
 
 def sigmoid_accept(x):
     zero = jax.nn.sigmoid(x) - jax.lax.stop_gradient(jax.nn.sigmoid(x)) # zero on fwd pass.
@@ -59,14 +61,11 @@ class ParallelMALA:
         logprob_nextstate, grad_nextstate = self.target_log_prob_and_grad(next_state, params["target_params"])
 
         # accept / reject
-        num = logprob_nextstate + tfd.MultivariateNormalDiag(
-            loc=next_state+step_size * grad_nextstate,
-            scale_diag=jnp.sqrt(2.0 * step_size) * jnp.ones_like(state)).log_prob(
-                state)
-        den = logprob_state + tfd.MultivariateNormalDiag(
-            loc=state+step_size * grad_state,
-            scale_diag=jnp.sqrt(2.0 * step_size) * jnp.ones_like(state)).log_prob(
-                next_state)
+        scale = jnp.sqrt(2.0 * step_size) * jnp.ones_like(state)
+        num = logprob_nextstate + _diag_mvn_logpdf(
+            state, next_state + step_size * grad_nextstate, scale)
+        den = logprob_state + _diag_mvn_logpdf(
+            next_state, state + step_size * grad_state, scale)
         g = sigmoid_accept(num-den-jnp.log(jr.uniform(skeys[1])))
         next_state = g*next_state + (1.0-g)*state
 

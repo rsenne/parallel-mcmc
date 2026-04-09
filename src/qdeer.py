@@ -32,7 +32,7 @@ def seq1d(
     xinp_flat = jax.tree_util.tree_flatten(xinp)[0][0]
     if yinit_guess is None:
         yinit_guess = jnp.zeros(
-            (xinp_flat.shape[0], y0.shape[-1]), dtype=xinp_flat.dtype
+            (xinp_flat.shape[0], y0.shape[-1]), dtype=y0.dtype
         )  # (nsamples, ny)
 
     def func2(y: jnp.ndarray, x: Any, params: Any) -> jnp.ndarray:
