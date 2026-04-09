@@ -33,9 +33,9 @@ PHI     = 0.9      # state transition coefficient
 SIGMA_Q = 0.5      # process noise std
 SIGMA_R = 1.0      # observation noise std
 
-T  = 512           # number of timesteps
+T  = 8192        # number of timesteps
 D  = 1             # latent dimension
-N  = 256           # number of particles
+N  = 32            # number of particles
 
 
 def kalman_filter(ys, phi, sigma_q, sigma_r):
@@ -126,14 +126,14 @@ t_seq = time.time() - t0
 seq_means = states_seq.reshape(T, D, N).mean(axis=-1)[:, 0]   # (T,)
 
 
-run_par = jax.jit(pf.run_parallel)
+run_par = jax.jit(pf.run_parallel, static_argnames=("max_iter", "num_samples"))
 key, deer_key2 = jr.split(key)
 params["key"] = deer_key2
 
-_ = run_par(s0, tape, params, max_iter=100)  # warmup
+_ = run_par(s0, tape, params, max_iter=100, damp_factor=0.9, num_samples=5)  # warmup
 
 t0 = time.time()
-states_par, iters = run_par(s0, tape, params, max_iter=100)
+states_par, iters = run_par(s0, tape, params, max_iter=100, damp_factor=0.9, num_samples=5)
 states_par.block_until_ready()
 t_par = time.time() - t0
 

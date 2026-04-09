@@ -25,7 +25,8 @@ def seq1d(
     full_trace: bool = False,  # XG addition
     damp_factor: float=1.0, # Damping 
     preconditioner: Any=None, # Diagonal preconditioner,
-    clip_val: float=1e8
+    clip_val: float=1e8,
+    num_samples: int=1, # Number of Rademacher samples for Hutchinson estimator
 ):
     # set the default initial guess
     xinp_flat = jax.tree_util.tree_flatten(xinp)[0][0]
@@ -60,8 +61,9 @@ def seq1d(
         clip_ytnext=True,
         full_trace=full_trace,
         damp_factor=damp_factor,
-        preconditioner=preconditioner, 
+        preconditioner=preconditioner,
         clip_val=clip_val,
+        num_samples=num_samples,
     )
 
     if full_trace:
@@ -165,6 +167,7 @@ def diagonal_deer_iteration_helper(
     damp_factor: float=1.0, # Damping 
     preconditioner: Any=None, # Diagonal preconditioner
     clip_val: float=1e8,
+    num_samples: int=1, # Number of Rademacher samples for Hutchinson estimator
 ) -> Tuple[jnp.ndarray, Optional[List[jnp.ndarray]], Callable]:
 
     precond = preconditioner if preconditioner is not None else jnp.ones((yinit_guess.shape[-1]))
@@ -173,6 +176,9 @@ def diagonal_deer_iteration_helper(
 
     def deer_jvp(z, driver, params, v):
         return jax.jvp(lambda z : dyn_func(z, driver, params), (z,), (v, ))
+
+    def _estimator(state, inputs, params, deer_jvp, key):
+        return quasi_diag_estimator(state, inputs, params, deer_jvp, key, num_samples=num_samples)
 
     dtype = yinit_guess.dtype
     # set the tolerance to be 1e-4 if dtype is float32, else 1e-7 for float64
@@ -186,7 +192,7 @@ def diagonal_deer_iteration_helper(
         # yt: (nsamples, ny)
         ytparams = shifter_func(yt, shifter_func_params)
 
-        rhs, gts = jax.vmap(quasi_diag_estimator, in_axes=(0, 0, None, None, 0))(
+        rhs, gts = jax.vmap(_estimator, in_axes=(0, 0, None, None, 0))(
             ytparams, xinput, params, deer_jvp, keys)
         gts = -jnp.clip(damp_factor / precond[None,:] * gts, -clip_val, clip_val)
         rhs += gts * ytparams 
