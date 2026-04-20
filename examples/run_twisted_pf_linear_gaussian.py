@@ -33,6 +33,7 @@ import jax.random as jr
 import matplotlib.pyplot as plt
 
 from src.particle_filter import TwistedParallelParticleFilter
+from src.baselines import bootstrap_pf, ffbsi_smoother
 
 PHI     = 0.9
 SIGMA_Q = 0.5
@@ -184,6 +185,49 @@ print(f"Parallel   twisted PF:  time={t_par:.3f}s   RMSE vs Kalman={rmse_par:.4f
       f"  ({deer_iters} DEER iters)")
 print(f"  (weighted means):                         RMSE vs Kalman={rmse_par_w:.4f}")
 print(f"Speedup: {t_seq / t_par:.2f}x")
+
+# Baselines: Bootstrap PF + FFBSi smoother
+def lgssm_transition_mean(x_prev, p):
+    return p['phi'] * x_prev
+
+def lgssm_log_lik(y_t, x_t, p):
+    return -0.5 * jnp.sum((y_t - x_t)**2) / p['sigma_r']**2
+
+key, bpf_key, ffbsi_key, init_key = jr.split(key, 4)
+x0_particles = jr.normal(init_key, (N, D)) * 1.0
+
+bpf_params = {'phi': PHI, 'sigma_q': SIGMA_Q, 'sigma_r': SIGMA_R}
+
+run_bpf = jax.jit(bootstrap_pf, static_argnames=("transition_mean", "log_lik"))
+_ = run_bpf(ys_2d, x0_particles, lgssm_transition_mean, lgssm_log_lik,
+            SIGMA_Q, bpf_params, bpf_key)
+
+t0 = time.time()
+bpf_filt, bpf_parts, bpf_log_w, bpf_ess, bpf_log_ml = run_bpf(
+    ys_2d, x0_particles, lgssm_transition_mean, lgssm_log_lik,
+    SIGMA_Q, bpf_params, bpf_key)
+bpf_filt.block_until_ready()
+t_bpf = time.time() - t0
+rmse_bpf = float(jnp.sqrt(jnp.mean((bpf_filt[:, 0] - kf_means)**2)))
+print(f"\nBootstrap PF (filter):  time={t_bpf:.3f}s   RMSE vs Kalman={rmse_bpf:.4f}"
+      f"  ESS mean={float(bpf_ess.mean()):.0f}/{N}")
+
+M_BACKWARD = N
+run_ffbsi = jax.jit(ffbsi_smoother, static_argnames=("M", "transition_mean"))
+_ = run_ffbsi(bpf_parts, bpf_log_w, lgssm_transition_mean,
+              SIGMA_Q, bpf_params, ffbsi_key, M=M_BACKWARD)
+
+t0 = time.time()
+bps_trajs = run_ffbsi(bpf_parts, bpf_log_w, lgssm_transition_mean,
+                       SIGMA_Q, bpf_params, ffbsi_key, M=M_BACKWARD)
+bps_trajs.block_until_ready()
+t_bps = time.time() - t0
+bps_means = bps_trajs.mean(axis=0)[:, 0]
+rmse_bps = float(jnp.sqrt(jnp.mean((bps_means - kf_means)**2)))
+print(f"Bootstrap PS (FFBSi):   time={t_bps:.3f}s   RMSE vs Kalman={rmse_bps:.4f}"
+      f"  (M={M_BACKWARD})")
+print(f"Twisted PF vs FFBSi:    RMSE  {float(rmse_par):.4f} vs {rmse_bps:.4f}"
+      f"   time  {t_par:.3f}s vs {t_bps:.3f}s   speedup {t_bps/t_par:.1f}x")
 
 plt.style.use("seaborn-v0_8-whitegrid")
 fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)

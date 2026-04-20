@@ -1,3 +1,12 @@
+# env stuff
 *.egg-info
 *.venv
+uv.lock
+
+# pycaches
 /src/__pycache__
+/examples/__pycache__
+
+#prelim results--to be deleted alter
+results_consolidation
+_lorenz_learned_twist.pkl

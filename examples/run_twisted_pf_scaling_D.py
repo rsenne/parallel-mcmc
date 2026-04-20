@@ -82,20 +82,62 @@ def log_weight_fn(x_prev, x_next, obs, twist, params):
     sigma_r   = params['sigma_r']
     mu_twist  = twist['mean']
     tau_twist = jnp.exp(twist['log_scale'])
+    D_state   = x_next.shape[0]
 
     # For log weights, we need A @ x_prev.  We store it in params.
     f_prev = params['_A'] @ x_prev
 
-    log_lik   = -0.5 * jnp.sum((obs - x_next)**2) / sigma_r**2
-    log_trans = -0.5 * jnp.sum((x_next - f_prev)**2) / sigma_q**2
+    log_lik   = (-0.5 * jnp.sum((obs - x_next)**2) / sigma_r**2
+                 - 0.5 * D_state * jnp.log(2 * jnp.pi * sigma_r**2))
+    log_trans = (-0.5 * jnp.sum((x_next - f_prev)**2) / sigma_q**2
+                 - 0.5 * D_state * jnp.log(2 * jnp.pi * sigma_q**2))
 
     prec_q     = 1.0 / sigma_q**2
     prec_twist = 1.0 / tau_twist**2
     var_post   = 1.0 / (prec_q + prec_twist)
     mean_post  = var_post * (prec_q * f_prev + prec_twist * mu_twist)
-    log_prop   = -0.5 * jnp.sum((x_next - mean_post)**2 / var_post)
-    log_norm   = 0.5 * jnp.sum(jnp.log(var_post) - 2 * jnp.log(sigma_q))
-    return log_lik + log_trans - log_prop + log_norm
+    log_prop  = (-0.5 * jnp.sum((x_next - mean_post)**2 / var_post)
+                 - 0.5 * jnp.sum(jnp.log(2 * jnp.pi * var_post)))
+    return log_lik + log_trans - log_prop
+
+def backward_information_filter(ys, A, Q, R):
+    """
+    Multivariate backward information filter: psi_t(x_t) = p(y_{t:T}|x_t).
+
+    Returns per-timestep twist means (T, D) and twist variances (T, D)
+    (diagonal of the inverse information matrix).
+    """
+    D = A.shape[0]
+    R_inv = jnp.linalg.inv(R)
+
+    def step(carry, y):
+        J, h = carry
+        # Predict backward through x_{t+1} = A x_t + noise
+        # Sigma = J^{-1} + Q;  J_pred = A^T (Sigma)^{-1} A
+        Sigma = jnp.linalg.inv(J) + Q
+        Sigma_inv = jnp.linalg.inv(Sigma)
+        J_pred = A.T @ Sigma_inv @ A
+        h_pred = A.T @ Sigma_inv @ jnp.linalg.solve(J, h)
+        # Add current observation
+        J_new = J_pred + R_inv
+        h_new = h_pred + R_inv @ y
+        return (J_new, h_new), (J_new, h_new)
+
+    J_T = R_inv
+    h_T = R_inv @ ys[-1]
+    _, (Js_rev, hs_rev) = jax.lax.scan(step, (J_T, h_T), ys[-2::-1])
+
+    Js = jnp.concatenate([Js_rev[::-1], J_T[None]], axis=0)  # (T, D, D)
+    hs = jnp.concatenate([hs_rev[::-1], h_T[None]], axis=0)  # (T, D)
+
+    # Extract diagonal twist params: mean = J^{-1} h, var = diag(J^{-1})
+    def extract(J, h):
+        J_inv = jnp.linalg.inv(J)
+        return J_inv @ h, jnp.diag(J_inv)
+
+    twist_means, twist_vars = jax.vmap(extract)(Js, hs)
+    return twist_means, twist_vars
+
 
 def make_independent_A(D):
     return PHI * jnp.eye(D)
@@ -125,13 +167,14 @@ def run_one(D, A, label, key):
         (jr.normal(k1, (T, D)), jr.normal(k2, (T, D)))
     )
 
-    # Kalman smoother
+    # Kalman smoother (for RMSE baseline)
     sm, sP = jax.jit(kalman_smoother)(ys, A, Q, R, jnp.zeros(D), jnp.eye(D))
-    sm_scales = jnp.sqrt(jax.vmap(jnp.diag)(sP))
 
+    # Optimal twist from backward information filter
+    twist_means, twist_vars = jax.jit(backward_information_filter)(ys, A, Q, R)
     twist_params = {
-        'mean':      sm,
-        'log_scale': jnp.log(sm_scales + 1e-8),
+        'mean':      twist_means,
+        'log_scale': 0.5 * jnp.log(twist_vars),
     }
 
     # filter

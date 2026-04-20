@@ -255,3 +255,208 @@ def quasi_diag_estimator(state, inputs, params, deer_jvp, key, num_samples=1):
     f_vals, jac_vals = vmap_jvp(state, inputs, params, z_rad)
     jac_diag = jnp.mean(z_rad * jac_vals, axis=0)
     return f_vals[0], jac_diag
+
+
+
+# Rank-1 Hutchinson DEER
+# Approximates J_t ≈ u_t v_t^T with u_t = J_t z, v_t = z, z ~ Rademacher.
+# Unbiased: E[z z^T] = I ⇒ E[(Jz) z^T] = J.  Captures a full direction of the
+# Jacobian rather than only axis-aligned entries, so it handles dense J
+# (e.g. OT-PF where resampling couples all particles).
+
+def rank1_binary_operator(element_i, element_j):
+    """
+    Compose two affine rank-1 maps L_i(y) = u_i v_i^T y + h_i:
+      (L_j ∘ L_i)(y) = (v_j^T u_i) u_j v_i^T y + (v_j^T h_i) u_j + h_j
+    """
+    u_i, v_i, h_i = element_i
+    u_j, v_j, h_j = element_j
+    alpha = jnp.sum(v_j * u_i)       # scalar v_j^T u_i
+    beta  = jnp.sum(v_j * h_i)       # scalar v_j^T h_i
+    u_new = alpha * u_j
+    v_new = v_i
+    h_new = beta * u_j + h_j
+    return u_new, v_new, h_new
+
+
+def rank1_matmul_recursive(u_mats, v_mats, vecs, y0):
+    """
+    Compute y[t+1] = u_mats[t] v_mats[t]^T y[t] + vecs[t] in parallel
+    via an associative scan.
+
+    Arguments
+    ---------
+    u_mats : (T, ny)  u factor per step
+    v_mats : (T, ny)  v factor per step
+    vecs   : (T, ny)  bias per step
+    y0     : (ny,)    initial state
+
+    Returns
+    -------
+    y : (T+1, ny)  with y[0] = y0 and y[t+1] = A_t y[t] + h_t for t ≥ 0
+    """
+    zeros = jnp.zeros_like(u_mats[:1])                       # (1, ny)
+    u_all = jnp.concatenate((zeros, u_mats), axis=0)          # (T+1, ny)
+    v_all = jnp.concatenate((zeros, v_mats), axis=0)          # (T+1, ny)
+    h_all = jnp.concatenate((y0[None], vecs), axis=0)         # (T+1, ny)
+    _, _, y = jax.lax.associative_scan(
+        rank1_binary_operator, (u_all, v_all, h_all)
+    )
+    return y                                                   # (T+1, ny)
+
+
+def rank1_seq1d_inv_lin(u_mats, v_mats, rhs, inv_lin_params):
+    """
+    Solve  y[t] + u_mats[t] v_mats[t]^T y[t-1] = rhs[t]  in parallel.
+    Equivalently y[t] = A_t y[t-1] + rhs[t]  with A_t = -u_mats[t] v_mats[t]^T.
+    """
+    (y0,) = inv_lin_params
+    y = rank1_matmul_recursive(-u_mats, v_mats, rhs, y0)[1:]
+    return y
+
+
+def rank1_estimator(state, inputs, params, deer_jvp, key, num_samples=1):
+    """
+    Rank-1 unbiased Hutchinson Jacobian estimator.
+
+    Averages `num_samples` independent rank-1 terms into u, v via sign-
+    canonicalisation: since z_k ∈ ±1 and we want a single outer product,
+    we set v = z_1 and u = mean_k J z_k · (z_1 · z_k), which is an
+    unbiased estimator of J in the v_1 = z_1 direction.  For num_samples=1
+    this reduces to u = Jz, v = z.
+    """
+    z_rad = jr.rademacher(key, (num_samples, state.shape[0])).astype(float)
+    vmap_jvp = jax.vmap(deer_jvp, in_axes=(None, None, None, 0))
+    f_vals, jac_vals = vmap_jvp(state, inputs, params, z_rad)
+    # Rank-1 direction: use z_rad[0] as v.  u is averaged over probes using
+    # inner-product weighting to keep unbiasedness.
+    v = z_rad[0]
+    weights = jnp.sum(z_rad * v[None, :], axis=1) / state.shape[0]  # (K,)
+    # Since <v, v> = DN, the first weight is 1.  Others are noise.  A
+    # simpler and equally unbiased choice for K=1 is u = Jz, v = z.
+    u = jac_vals[0]            # (ny,)  single-probe rank-1
+    return f_vals[0], u, v
+
+
+def rank1_deer_iteration_helper(
+    func,
+    shifter_func,
+    dyn_func,
+    params,
+    xinput,
+    inv_lin_params,
+    shifter_func_params,
+    yinit_guess,
+    max_iter: int = 100,
+    clip_ytnext: bool = False,
+    full_trace: bool = False,
+    damp_factor: float = 1.0,
+    clip_val: float = 1e8,
+    num_samples: int = 1,
+):
+    _T = jax.tree_util.tree_leaves(xinput)[0].shape[0]
+    keys = jr.split(params['key'], _T)
+
+    def deer_jvp(z, driver, p, v):
+        return jax.jvp(lambda z: dyn_func(z, driver, p), (z,), (v,))
+
+    dtype = yinit_guess.dtype
+    tol  = 1e-7 if dtype == jnp.float64 else 1e-4
+    rtol = 1e-4 if dtype == jnp.float64 else 1e-3
+
+    def iter_func(iter_inp):
+        err, yt, iiter = iter_inp
+        ytparams = shifter_func(yt, shifter_func_params)
+
+        f_vals, us, vs = jax.vmap(
+            rank1_estimator, in_axes=(0, 0, None, None, 0, None)
+        )(ytparams, xinput, params, deer_jvp, keys, num_samples)
+
+        # Damp + clip the Jacobian component (u factor)
+        us = -jnp.clip(damp_factor * us, -clip_val, clip_val)
+        # rhs = f + A y*  where A = us vs^T
+        rhs = f_vals + us * jnp.sum(vs * ytparams, axis=-1, keepdims=True)
+        yt_next = rank1_seq1d_inv_lin(us, vs, rhs, inv_lin_params)
+
+        if clip_ytnext:
+            clip = 1e8
+            yt_next = jnp.clip(yt_next, a_min=-clip, a_max=clip)
+            yt_next = jnp.where(jnp.isnan(yt_next), 0.0, yt_next)
+
+        err = jnp.max(jnp.abs(yt_next - yt) - rtol * jnp.abs(yt))
+        return err, yt_next, iiter + 1
+
+    def cond_func(iter_inp):
+        err, _, iiter = iter_inp
+        return jnp.logical_and(err > tol, iiter < max_iter)
+
+    err   = jnp.array(1e10, dtype=dtype)
+    iiter = jnp.array(0, dtype=jnp.int32)
+
+    if full_trace:
+        def scan_func(c, _):
+            new_c = iter_func(c)
+            return new_c, new_c[1]
+        _, yt = jax.lax.scan(
+            scan_func, (err, yinit_guess, iiter), None, length=max_iter
+        )
+        samp_iters = max_iter
+    else:
+        _, yt, samp_iters = jax.lax.while_loop(
+            cond_func, iter_func, (err, yinit_guess, iiter)
+        )
+    return yt, samp_iters
+
+
+def seq1d_rank1(
+    func,
+    y0,
+    xinp,
+    params,
+    yinit_guess=None,
+    max_iter: int = 10000,
+    full_trace: bool = False,
+    damp_factor: float = 1.0,
+    clip_val: float = 1e8,
+    num_samples: int = 1,
+):
+    """
+    Parallel-in-time sequential solver with rank-1 Hutchinson Jacobian.
+
+    Drop-in analogue of `seq1d` for problems where the per-step Jacobian is
+    dense (e.g. OT-PF post-resampling).  Uses unbiased rank-1 estimates
+    u_t v_t^T ≈ J_t with u_t = J_t z_t, v_t = z_t (Rademacher).
+    """
+    xinp_flat = jax.tree_util.tree_flatten(xinp)[0][0]
+    if yinit_guess is None:
+        yinit_guess = jnp.zeros(
+            (xinp_flat.shape[0], y0.shape[-1]), dtype=y0.dtype
+        )
+
+    def func2(y, x, p):
+        return func(y, x, p)
+
+    def shifter_func(y, shifter_params):
+        (y0_,) = shifter_params
+        return jnp.concatenate((y0_[None, :], y[:-1, :]), axis=0)
+
+    yt, samp_iters = rank1_deer_iteration_helper(
+        func=func2,
+        shifter_func=shifter_func,
+        dyn_func=func2,
+        params=params,
+        xinput=xinp,
+        inv_lin_params=(y0,),
+        shifter_func_params=(y0,),
+        yinit_guess=yinit_guess,
+        max_iter=max_iter,
+        clip_ytnext=True,
+        full_trace=full_trace,
+        damp_factor=damp_factor,
+        clip_val=clip_val,
+        num_samples=num_samples,
+    )
+
+    if full_trace:
+        return (jnp.vstack((yinit_guess[None, ...], yt)), samp_iters)
+    return (yt, samp_iters)

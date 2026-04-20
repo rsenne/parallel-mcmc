@@ -85,8 +85,13 @@ class STAMPEDE:
         def log_posterior(theta, target_params):
             model_params = theta_to_params_fn(theta)
             if compute_twists_fn is not None:
-                twist_params = compute_twists_fn(
-                    model_params, target_params['observations'])
+                # Stop gradient through twist computation: the twist
+                # improves the PF proposal quality but should not be
+                # differentiated through for MALA gradients (can cause
+                # instability for nonlinear observation models like SV).
+                twist_params = jax.lax.stop_gradient(
+                    compute_twists_fn(model_params, target_params['observations'])
+                )
             else:
                 twist_params = target_params['twist_params']
             tape = (

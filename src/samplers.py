@@ -53,12 +53,22 @@ class ParallelMALA:
         step_size = params["step_size"]
         key, *skeys = jr.split(driver, 3)
 
+        # hacky clip for some models. Works and is cheap
+        grad_max_norm = params.get("grad_max_norm", 50.0)
+
+        def _clip_norm(g):
+            gnorm = jnp.linalg.norm(g)
+            scale = jnp.minimum(1.0, grad_max_norm / (gnorm + 1e-12))
+            return g * scale
+
         logprob_state, grad_state = self.target_log_prob_and_grad(state, params["target_params"])
-        next_state = state + step_size * grad_state # grad_logp is previously defined score function (todo: have it take in params)
+        grad_state = _clip_norm(grad_state)
+        next_state = state + step_size * grad_state
         next_state = next_state + jnp.sqrt(2.0 * step_size) * jr.normal(skeys[0], (state.shape[0],))
 
         # get new log prob and grad
         logprob_nextstate, grad_nextstate = self.target_log_prob_and_grad(next_state, params["target_params"])
+        grad_nextstate = _clip_norm(grad_nextstate)
 
         # accept / reject
         scale = jnp.sqrt(2.0 * step_size) * jnp.ones_like(state)

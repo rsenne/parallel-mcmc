@@ -71,6 +71,26 @@ def rts_smoother(m_filts, P_filts, m_preds, P_preds, phi):
     return smooth_means, smooth_vars
 
 
+def backward_information_filter_1d(ys, phi, sigma_q, sigma_r):
+    """Optimal twist via backward information filter: psi_t(x_t) = p(y_{t:T}|x_t)."""
+    prec_obs = 1.0 / sigma_r**2
+    sq = sigma_q**2
+    def step(carry, y):
+        J, h = carry
+        denom = 1.0 + sq * J
+        J_pred = phi**2 * J / denom
+        h_pred = phi * h / denom
+        J_new = J_pred + prec_obs
+        h_new = h_pred + y * prec_obs
+        return (J_new, h_new), (J_new, h_new)
+    J_T = prec_obs
+    h_T = ys[-1] * prec_obs
+    _, (Js_rev, hs_rev) = jax.lax.scan(step, (J_T, h_T), ys[-2::-1])
+    Js = jnp.concatenate([Js_rev[::-1], jnp.array([J_T])])
+    hs = jnp.concatenate([hs_rev[::-1], jnp.array([h_T])])
+    return hs / Js, 1.0 / Js
+
+
 def twisted_step_fn(x_prev, driver, params):
     obs, noise, twist = driver
     phi     = params['phi']
@@ -90,15 +110,17 @@ def log_weight_fn(x_prev, x_next, obs, twist, params):
     sigma_r = params['sigma_r']
     mu_twist  = twist['mean']
     tau_twist = jnp.exp(twist['log_scale'])
-    log_lik   = -0.5 * jnp.sum((obs - x_next)**2) / sigma_r**2
-    log_trans  = -0.5 * jnp.sum((x_next - phi * x_prev)**2) / sigma_q**2
+    log_lik   = (-0.5 * jnp.sum((obs - x_next)**2) / sigma_r**2
+                 - 0.5 * D * jnp.log(2 * jnp.pi * sigma_r**2))
+    log_trans = (-0.5 * jnp.sum((x_next - phi * x_prev)**2) / sigma_q**2
+                 - 0.5 * D * jnp.log(2 * jnp.pi * sigma_q**2))
     prec_q     = 1.0 / sigma_q**2
     prec_twist = 1.0 / tau_twist**2
     var_post   = 1.0 / (prec_q + prec_twist)
     mean_post  = var_post * (prec_q * phi * x_prev + prec_twist * mu_twist)
-    log_prop   = -0.5 * jnp.sum((x_next - mean_post)**2 / var_post)
-    log_norm   = 0.5 * jnp.sum(jnp.log(var_post) - 2 * jnp.log(sigma_q))
-    return log_lik + log_trans - log_prop + log_norm
+    log_prop  = (-0.5 * jnp.sum((x_next - mean_post)**2 / var_post)
+                 - 0.5 * jnp.sum(jnp.log(2 * jnp.pi * var_post)))
+    return log_lik + log_trans - log_prop
 
 
 tpf = TwistedParallelParticleFilter(twisted_step_fn, log_weight_fn, D=D)
@@ -123,13 +145,16 @@ for T in T_VALUES:
     )
     ys_2d = ys[:, None]
 
-    # Kalman smoother → optimal twists
+    # Kalman smoother for RMSE baseline
     m_f, P_f, m_p, P_p = kalman_filter(ys, PHI, SIGMA_Q, SIGMA_R)
     sm_means, sm_vars = rts_smoother(m_f, P_f, m_p, P_p, PHI)
 
+    # Optimal twist from backward information filter
+    twist_means, twist_vars = backward_information_filter_1d(ys, PHI, SIGMA_Q, SIGMA_R)
+
     twist_params = {
-        'mean':      sm_means[:, None],
-        'log_scale': 0.5 * jnp.log(sm_vars)[:, None],
+        'mean':      twist_means[:, None],
+        'log_scale': 0.5 * jnp.log(twist_vars)[:, None],
     }
 
     # tape & initial particles

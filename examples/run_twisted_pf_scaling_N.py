@@ -49,6 +49,25 @@ def kalman_smoother_1d(ys, phi, sigma_q, sigma_r):
     sP = jnp.concatenate([Ps_r[::-1], Pf[-1:]])
     return sm, sP
 
+def backward_information_filter_1d(ys, phi, sigma_q, sigma_r):
+    """Optimal twist via backward information filter: psi_t(x_t) = p(y_{t:T}|x_t)."""
+    prec_obs = 1.0 / sigma_r**2
+    sq = sigma_q**2
+    def step(carry, y):
+        J, h = carry
+        denom = 1.0 + sq * J
+        J_pred = phi**2 * J / denom
+        h_pred = phi * h / denom
+        J_new = J_pred + prec_obs
+        h_new = h_pred + y * prec_obs
+        return (J_new, h_new), (J_new, h_new)
+    J_T = prec_obs
+    h_T = ys[-1] * prec_obs
+    _, (Js_rev, hs_rev) = jax.lax.scan(step, (J_T, h_T), ys[-2::-1])
+    Js = jnp.concatenate([Js_rev[::-1], jnp.array([J_T])])
+    hs = jnp.concatenate([hs_rev[::-1], jnp.array([h_T])])
+    return hs / Js, 1.0 / Js
+
 def twisted_step_fn(x_prev, driver, params):
     obs, noise, twist = driver
     phi     = params['phi']
@@ -64,14 +83,16 @@ def twisted_step_fn(x_prev, driver, params):
 def log_weight_fn(x_prev, x_next, obs, twist, params):
     phi = params['phi']; sq = params['sigma_q']; sr = params['sigma_r']
     mu = twist['mean']; tau = jnp.exp(twist['log_scale'])
-    ll = -0.5 * jnp.sum((obs - x_next)**2) / sr**2
-    lt = -0.5 * jnp.sum((x_next - phi * x_prev)**2) / sq**2
+    log_lik   = (-0.5 * jnp.sum((obs - x_next)**2) / sr**2
+                 - 0.5 * D * jnp.log(2 * jnp.pi * sr**2))
+    log_trans = (-0.5 * jnp.sum((x_next - phi * x_prev)**2) / sq**2
+                 - 0.5 * D * jnp.log(2 * jnp.pi * sq**2))
     pq = 1.0 / sq**2; pt = 1.0 / tau**2
     vp = 1.0 / (pq + pt)
     mp = vp * (pq * phi * x_prev + pt * mu)
-    lp = -0.5 * jnp.sum((x_next - mp)**2 / vp)
-    ln = 0.5 * jnp.sum(jnp.log(vp) - 2 * jnp.log(sq))
-    return ll + lt - lp + ln
+    log_prop  = (-0.5 * jnp.sum((x_next - mp)**2 / vp)
+                 - 0.5 * jnp.sum(jnp.log(2 * jnp.pi * vp)))
+    return log_lik + log_trans - log_prop
 
 key = jr.PRNGKey(7)
 key, k1, k2, k3 = jr.split(key, 4)
@@ -87,7 +108,9 @@ _, (true_xs, ys) = jax.lax.scan(
 ys_2d = ys[:, None]
 
 sm, sP = kalman_smoother_1d(ys, PHI, SIGMA_Q, SIGMA_R)
-twist_params = {'mean': sm[:, None], 'log_scale': 0.5 * jnp.log(sP)[:, None]}
+# Optimal twist from backward information filter (not smoother marginal)
+twist_means, twist_vars = backward_information_filter_1d(ys, PHI, SIGMA_Q, SIGMA_R)
+twist_params = {'mean': twist_means[:, None], 'log_scale': 0.5 * jnp.log(twist_vars)[:, None]}
 params_base = {'phi': PHI, 'sigma_q': SIGMA_Q, 'sigma_r': SIGMA_R}
 results = []
 
