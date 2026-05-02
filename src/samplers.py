@@ -22,17 +22,21 @@ class ParallelMALA:
     
     # our constructor
     def __init__(self, log_prob, dim, chain_length, max_iter, alg="quasi",
-                 clip_val=1.0, damp_factor=1.0, full_trace=False, 
-                 basis_transformation=False, window_size=None):
+                 clip_val=1.0, damp_factor=1.0, full_trace=False,
+                 basis_transformation=False, window_size=None, sigmasq=1e8):
         '''
         Args:
             logp - unnormalized log-posterior function that ONLY takes in theta as argument. Use partial.
             dim - how many dimensions is our parameter space for sampling? (added together)
             epsilon - the MALA stepsize.
-            quasi - are we taking diagonal or full Jacobian?
-            qmem_efficient - are we using the Hutchinson's estimator?
+            alg - parallel solver: "quasi" (quasi-DEER, diagonal Hutchinson + associative scan)
+                  or "quasi_elk" (Levenberg-Marquardt damped Newton via scalar Kalman filter).
+                  quasi_elk is the sigmasq -> inf limit of quasi; at finite sigmasq it pulls
+                  DEER iterates toward the current guess, avoiding the pathological-Jacobian
+                  excursions that normally require gradient-norm clipping in the MALA map.
             clip_val - what are we clipping individual gradient entries to in absolute value?
             damp_factor - slightly damping the Jacobian.
+            sigmasq - Quasi-ELK emission noise (ignored when alg="quasi"). Large sigmasq ~= DEER.
         '''
         # 1. internalize + get the target log-prob and grad
         self.log_prob = log_prob
@@ -40,12 +44,13 @@ class ParallelMALA:
         self.chain_length = chain_length
         self.target_log_prob_and_grad = jax.value_and_grad(self.log_prob)
         self.max_iter = max_iter
-        self.alg = alg 
+        self.alg = alg
         self.clip_val = clip_val
         self.damp_factor = damp_factor
-        self.full_trace = full_trace 
+        self.full_trace = full_trace
         self.basis_transformation = basis_transformation
         self.window_size = window_size
+        self.sigmasq = sigmasq
         if self.window_size is not None:
             assert 1 <= self.window_size <= self.chain_length
         
@@ -53,13 +58,19 @@ class ParallelMALA:
         step_size = params["step_size"]
         key, *skeys = jr.split(driver, 3)
 
-        # hacky clip for some models. Works and is cheap
+        # Gradient-norm clip, bounded so DEER's Newton iterates stay in a well-conditioned
+        # Jacobian regime. Pass grad_max_norm=None to disable (e.g., when pairing Quasi-ELK
+        # damping with the unclipped MALA map); the lambda is then skipped at trace time so
+        # autodiff doesn't encounter 0*inf through jnp.minimum.
         grad_max_norm = params.get("grad_max_norm", 50.0)
 
-        def _clip_norm(g):
-            gnorm = jnp.linalg.norm(g)
-            scale = jnp.minimum(1.0, grad_max_norm / (gnorm + 1e-12))
-            return g * scale
+        if grad_max_norm is None:
+            _clip_norm = lambda g: g
+        else:
+            def _clip_norm(g):
+                gnorm = jnp.linalg.norm(g)
+                scale = jnp.minimum(1.0, grad_max_norm / (gnorm + 1e-12))
+                return g * scale
 
         logprob_state, grad_state = self.target_log_prob_and_grad(state, params["target_params"])
         grad_state = _clip_norm(grad_state)
@@ -99,19 +110,28 @@ class ParallelMALA:
         drivers = jr.split(key, (self.chain_length,))
 
         if self.basis_transformation:
-            initial_state = params["basis"].T @ initial_state 
+            initial_state = params["basis"].T @ initial_state
             yinit_guess = jnp.einsum('...ij, ...j -> ...i', params["basis"].T, yinit_guess)
 
-        out_states, iters = qdeer.seq1d(
-            self.mala_fxn_for_deer, initial_state, drivers, params, 
-            yinit_guess=yinit_guess, max_iter=self.max_iter, clip_val=self.clip_val,
-            full_trace=self.full_trace, damp_factor=self.damp_factor
-        )
+        if self.alg == "quasi_elk":
+            sigmasq = params.get("sigmasq", self.sigmasq)
+            out_states, iters = elk.quasi_elk_seq1d(
+                self.mala_fxn_for_deer, initial_state, drivers, params,
+                yinit_guess=yinit_guess, sigmasq=sigmasq,
+                max_iter=self.max_iter, clip_val=self.clip_val,
+                full_trace=self.full_trace, damp_factor=self.damp_factor,
+            )
+        else:
+            out_states, iters = qdeer.seq1d(
+                self.mala_fxn_for_deer, initial_state, drivers, params,
+                yinit_guess=yinit_guess, max_iter=self.max_iter, clip_val=self.clip_val,
+                full_trace=self.full_trace, damp_factor=self.damp_factor
+            )
 
         if self.basis_transformation:
             out_states = jnp.einsum('...ij, ...j -> ...i', params["basis"], out_states)
 
-        return out_states, iters 
+        return out_states, iters
 
     def run_parallel_mala_window(self, key, initial_state, yinit_guess, params):
         drivers = jr.split(key, (self.chain_length,))

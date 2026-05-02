@@ -29,7 +29,7 @@ class STAMPEDE:
     Doubly-parallel particle MCMC.
 
     Composes ParallelMALA (outer DEER loop over MCMC iterations) with
-    TwistedParallelParticleFilter (inner sequential PF for likelihood).
+    TwistedParallelParticleFilter.
 
     Parameters
     ----------
@@ -71,6 +71,8 @@ class STAMPEDE:
         damp_factor: float = 0.8,
         clip_val: float = 1.0,
         compute_twists_fn: Callable = None,
+        alg: str = "quasi",
+        sigmasq: float = 1e8,
     ):
         self.tpf = TwistedParallelParticleFilter(
             twisted_step_fn, pf_log_weight_fn, D=D_state,
@@ -119,6 +121,8 @@ class STAMPEDE:
             max_iter=max_deer_iter,
             clip_val=clip_val,
             damp_factor=damp_factor,
+            alg=alg,
+            sigmasq=sigmasq,
         )
 
     def run_sequential(self, key, theta0, params):

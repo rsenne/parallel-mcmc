@@ -218,6 +218,8 @@ sampler = ParallelMALA(
     max_iter=1000,
     clip_val=1.0,
     damp_factor=1.0,
+    alg="quasi_elk",
+    sigmasq=1e4,
 )
 
 run_seq_block = jax.jit(sampler.run_sequential_mala)
@@ -230,7 +232,7 @@ print(f"\n--- [2] OT-PF + MALA seq ({B} blocks x {K_BLOCK}, noise refresh) ---")
 key, wkey, wnkey, wx0key = jr.split(key, 4)
 pf_noise_w = jr.normal(wnkey, (T, D, N))
 x0s_w = jr.normal(wx0key, (D, N))
-params_w = {'step_size': 1.5e-2, 'target_params': {
+params_w = {'step_size': 1.5e-2, 'grad_max_norm': None, 'target_params': {
     'observations': ys_2d, 'pf_noise': pf_noise_w, 'x0s': x0s_w,
 }}
 _ = run_seq_block(wkey, theta0, params_w)
@@ -244,7 +246,7 @@ for b in range(B):
     key, seq_key, noise_key, x0_key = jr.split(key, 4)
     pf_noise = jr.normal(noise_key, (T, D, N))
     x0s = jr.normal(x0_key, (D, N))
-    params_block = {'step_size': 1.5e-2, 'target_params': {
+    params_block = {'step_size': 1.5e-2, 'grad_max_norm': None, 'target_params': {
         'observations': ys_2d,
         'pf_noise':     pf_noise,
         'x0s':          x0s,
@@ -295,7 +297,7 @@ _make_yinit_jit = jax.jit(_make_yinit)
 key, wkey2, wdkey, wnkey2, wx0key2, wykey = jr.split(key, 6)
 pf_noise_w2 = jr.normal(wnkey2, (T, D, N))
 x0s_w2 = jr.normal(wx0key2, (D, N))
-params_w2 = {'step_size': 1.5e-2, 'key': wdkey, 'target_params': {
+params_w2 = {'step_size': 1.5e-2, 'key': wdkey, 'grad_max_norm': None, 'target_params': {
     'observations': ys_2d, 'pf_noise': pf_noise_w2, 'x0s': x0s_w2,
 }}
 yinit_w = _make_yinit_jit(wkey2, theta0, params_w2)
@@ -312,7 +314,7 @@ for b in range(B):
     key, par_key, deer_key, noise_key, x0_key = jr.split(key, 5)
     pf_noise = jr.normal(noise_key, (T, D, N))
     x0s = jr.normal(x0_key, (D, N))
-    params_block = {'step_size': 1.5e-2, 'key': deer_key, 'target_params': {
+    params_block = {'step_size': 1.5e-2, 'key': deer_key, 'grad_max_norm': None, 'target_params': {
         'observations': ys_2d,
         'pf_noise':     pf_noise,
         'x0s':          x0s,

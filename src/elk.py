@@ -10,6 +10,7 @@ from jax import lax, vmap
 from jax.lax import scan
 
 import jax.numpy as jnp
+import jax.random as jr
 
 from jaxtyping import Array, Float
 from typing import NamedTuple, Union, Optional
@@ -324,6 +325,123 @@ def elk_alg(
             cond_func, iter_func, (err, states_guess, iiter)
         )
         return yt, samp_iters
+
+
+def quasi_elk_seq1d(
+    func,
+    y0: jnp.ndarray,
+    xinp,
+    params,
+    yinit_guess: Optional[jnp.ndarray] = None,
+    sigmasq: float = 1e8,
+    max_iter: int = 10000,
+    full_trace: bool = False,
+    damp_factor: float = 1.0,
+    clip_val: float = 1e8,
+    num_samples: int = 1,
+):
+    """Parallel-in-time fixed-point solver via Quasi-ELK.
+
+    Drop-in alternative to ``qdeer.seq1d``. Solves
+    ``y[t+1] = func(y[t], xinp[t], params)`` for ``t = 0, ..., T-1`` with
+    ``y[0] = y0`` by iteratively linearising ``func`` and running a scalar
+    Kalman filter per state dimension with emission noise ``sigmasq`` on the
+    current guess.
+
+    For each fixed-point iterate the linearised recurrence
+    ``z_{t+1} = A_t z_t + b_t + w_t`` is treated as a latent state-space model
+    with noisy observations ``o_t = z_t + v_t``, ``v_t ~ N(0, sigmasq)``, and
+    the next iterate is the Kalman filter's posterior mean. This is
+    Levenberg-Marquardt damping on the Newton step: ``sigmasq -> inf`` recovers
+    DEER (no regularisation); finite ``sigmasq`` pulls iterates toward the
+    current guess and prevents excursions into pathological Jacobian regimes.
+    """
+    xinp_flat = jax.tree_util.tree_flatten(xinp)[0][0]
+    T = xinp_flat.shape[0]
+    D = y0.shape[-1]
+
+    if yinit_guess is None:
+        yinit_guess = jnp.zeros((T, D), dtype=y0.dtype)
+
+    keys = jr.split(params["key"], T)
+    dtype = yinit_guess.dtype
+    tol = 1e-7 if dtype == jnp.float64 else 1e-4
+    rtol = 1e-4 if dtype == jnp.float64 else 1e-3
+
+    def jvp_fn(z, driver, p, v):
+        return jax.jvp(lambda zz: func(zz, driver, p), (z,), (v,))
+
+    def estimator(state, driver, p, key):
+        z_rad = jr.rademacher(key, (num_samples, state.shape[0])).astype(float)
+        vmap_jvp = jax.vmap(jvp_fn, in_axes=(None, None, None, 0))
+        f_vals, jac_vals = vmap_jvp(state, driver, p, z_rad)
+        jac_diag = jnp.mean(z_rad * jac_vals, axis=0)
+        return f_vals[0], jac_diag
+
+    def shift(y):
+        # y0 at index 0, then y[0]..y[T-2] at indices 1..T-1.
+        return jnp.concatenate((y0[None, :], y[:-1, :]), axis=0)
+
+    def iter_body(yt):
+        ytparams = shift(yt)  # (T, D)
+        fs, jac_diags = jax.vmap(estimator, in_axes=(0, 0, None, 0))(
+            ytparams, xinp, params, keys
+        )  # (T, D) each
+
+        As = jnp.clip(damp_factor * jac_diags, -clip_val, clip_val)  # (T, D)
+        bs = fs - As * ytparams  # (T, D)
+
+        # Scalar-Kalman-per-dim view:
+        # z_1 is deterministic from fixed y0, with prior mean fs[0].
+        # For k >= 1, z_{k+1} = As[k] * z_k + bs[k] + w, and we observe z_k = yt[k-1] + v.
+        initial_mean = fs[0]          # (D,)
+        dyn_weights = As[1:]          # (T-1, D) -- transitions z_1 -> z_2, ..., z_{T-1} -> z_T
+        dyn_bias = bs[1:]             # (T-1, D)
+        emission_noises = jnp.full((T,), sigmasq, dtype=dtype)
+
+        scalar_params = make_scalar_params(
+            initial_mean=initial_mean,
+            dynamics_weights=dyn_weights,
+            dynamics_bias=dyn_bias,
+            emission_noises=emission_noises,
+        )
+
+        post = jax.vmap(
+            parallel_scalar_filter,
+            in_axes=(ScalarParams(0, 1, 1, None), 1),
+            out_axes=1,
+        )(scalar_params, yt)
+
+        return post.filtered_means  # (T, D)
+
+    def iter_func(iter_inp):
+        err, yt, iiter = iter_inp
+        yt_next = iter_body(yt)
+        yt_next = jnp.clip(yt_next, -1e8, 1e8)
+        yt_next = jnp.where(jnp.isnan(yt_next), 0.0, yt_next)
+        err = jnp.max(jnp.abs(yt_next - yt) - rtol * jnp.abs(yt))
+        return err, yt_next, iiter + 1
+
+    def cond_func(iter_inp):
+        err, _, iiter = iter_inp
+        return jnp.logical_and(err > tol, iiter < max_iter)
+
+    err_init = jnp.array(1e10, dtype=dtype)
+    iiter_init = jnp.array(0, dtype=jnp.int32)
+
+    if full_trace:
+        def scan_func(c, _):
+            new_c = iter_func(c)
+            return new_c, new_c[1]
+        _, yt = jax.lax.scan(
+            scan_func, (err_init, yinit_guess, iiter_init), None, length=max_iter
+        )
+        return jnp.vstack((yinit_guess[None, ...], yt)), max_iter
+
+    _, yt, samp_iters = jax.lax.while_loop(
+        cond_func, iter_func, (err_init, yinit_guess, iiter_init)
+    )
+    return yt, samp_iters
 
 
 @jax.vmap

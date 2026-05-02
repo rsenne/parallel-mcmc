@@ -259,7 +259,7 @@ print(f"\n--- [2] Twisted PMCMC (MALA, {B} blocks x {K_BLOCK}, noise refresh) --
 key, wkey, wnkey, wx0key = jr.split(key, 4)
 pf_noise_w = jr.normal(wnkey, (N, T, D))
 x0s_w = jr.normal(wx0key, (N, D))
-params_w = {'step_size': 3e-3, 'target_params': {
+params_w = {'step_size': 3e-3, 'grad_max_norm': None, 'target_params': {
     'observations': ys_2d, 'pf_noise': pf_noise_w,
     'twist_params': twist_params_dummy, 'x0s': x0s_w,
 }}
@@ -280,7 +280,7 @@ for b in range(B):
         'twist_params': twist_params_dummy,
         'x0s':          x0s,
     }
-    params_block = {'step_size': 3e-3, 'target_params': target_params}
+    params_block = {'step_size': 3e-3, 'grad_max_norm': None, 'target_params': target_params}
 
     t0 = time.perf_counter()
     chain_block = run_seq_block(seq_key, theta_curr, params_block)
@@ -316,7 +316,7 @@ _make_yinit_jit = jax.jit(_make_yinit)
 key, wkey2, wdkey, wnkey2, wx0key2 = jr.split(key, 5)
 pf_noise_w2 = jr.normal(wnkey2, (N, T, D))
 x0s_w2 = jr.normal(wx0key2, (N, D))
-params_w2 = {'step_size': 3e-3, 'key': wdkey, 'target_params': {
+params_w2 = {'step_size': 3e-3, 'key': wdkey, 'grad_max_norm': None, 'target_params': {
     'observations': ys_2d, 'pf_noise': pf_noise_w2,
     'twist_params': twist_params_dummy, 'x0s': x0s_w2,
 }}
@@ -340,7 +340,7 @@ for b in range(B):
         'twist_params': twist_params_dummy,
         'x0s':          x0s,
     }
-    params_block = {'step_size': 3e-3, 'key': deer_key,
+    params_block = {'step_size': 3e-3, 'key': deer_key, 'grad_max_norm': None,
                     'target_params': target_params}
 
     t0 = time.perf_counter()
