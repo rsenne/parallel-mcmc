@@ -134,8 +134,8 @@ def run_one_T(T, seed=0):
 
     params_par = {**model_params, "key": k6, "tau": TAU}
 
-    t_seq, (states_seq, _, _) = time_min(run_seq, x0s, tape, model_params)
-    t_par, (states_par, iters_per_win, _) = time_min(
+    t_seq, (states_seq, _, _, _) = time_min(run_seq, x0s, tape, model_params)
+    t_par, (states_par, iters_per_win, _, _) = time_min(
         lambda x0_, t_, p_: run_par(x0_, t_, p_, max_iter=MAX_ITER),
         x0s, tape, params_par,
     )

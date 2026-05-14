@@ -491,8 +491,12 @@ class TwistedGumbelParticleFilter:
 
             # log Z increment for this window:
             #   log( (1/N) sum_i exp( log_w_acc_i + sum_t log_w_t_i ) )
-            log_Z_inc = (jax.scipy.special.logsumexp(log_w_window_total)
-                         - jnp.log(float(N)))
+            log_norm = jax.scipy.special.logsumexp(log_w_window_total)
+            log_Z_inc = log_norm - jnp.log(float(N))
+
+            # ESS at the resample point (before resampling).
+            w_norm = jnp.exp(log_w_window_total - log_norm)
+            ess = 1.0 / jnp.sum(w_norm**2)
 
             end_particles = states_w[:, -1, :]                       # (N, D)
 
@@ -504,7 +508,7 @@ class TwistedGumbelParticleFilter:
             new_particles = X_resamp.T                               # (N, D)
             new_log_w_acc = jnp.zeros_like(log_w_acc)
 
-            return (new_particles, new_log_w_acc), (states_w, iters, log_Z_inc)
+            return (new_particles, new_log_w_acc), (states_w, iters, log_Z_inc, ess)
 
         init = (x0s, jnp.zeros(N, dtype=x0s.dtype))
         scan_inputs = (
@@ -514,20 +518,25 @@ class TwistedGumbelParticleFilter:
             gumbel_w,
             deer_keys_outer,
         )
-        _, (states_chunks, iters_chunks, logZ_per_window) = jax.lax.scan(
-            window_step, init, scan_inputs
+        _, (states_chunks, iters_chunks, logZ_per_window, ess_per_window) = (
+            jax.lax.scan(window_step, init, scan_inputs)
         )
         # states_chunks: (num_windows, N, K, D) -> (N, T, D)
         states = states_chunks.transpose(1, 0, 2, 3).reshape(
             N, num_windows * K, self.D
         )
         log_Z = jnp.sum(logZ_per_window)
-        return states, iters_chunks, log_Z
+        return states, iters_chunks, log_Z, ess_per_window
 
     def run_sequential(self, x0s, tape, params):
         """Sequential twisted PF with Gumbel-STE checkpoint resampling.
 
-        Returns (states (N, T, D), iters_per_window (zeros), log_Z scalar).
+        Returns (states, iters_per_window, log_Z, ess_per_window):
+            states          : (N, T, D)
+            iters_per_window: (num_windows, N) — zeros in sequential mode
+            log_Z           : scalar
+            ess_per_window  : (num_windows,) — ESS at each resample point
+                              before resampling.
         """
         return self._run(x0s, tape, params, mode="sequential")
 
@@ -538,7 +547,7 @@ class TwistedGumbelParticleFilter:
         particles. Resampling is applied serially at window boundaries.
 
         params must contain 'key' (used to split per-window DEER keys).
-        Returns (states (N, T, D), iters_per_window (num_windows, N), log_Z).
+        Returns (states, iters_per_window, log_Z, ess_per_window).
         """
         return self._run(x0s, tape, params, mode="parallel",
                          max_iter=max_iter)

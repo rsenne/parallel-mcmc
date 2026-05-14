@@ -141,7 +141,7 @@ def main():
     _ = run_seq(x0s, tape, model_params)              # warmup
     jax.block_until_ready(_)
     t0 = time.perf_counter()
-    states_seq, _, logZ_seq = run_seq(x0s, tape, model_params)
+    states_seq, _, logZ_seq, ess_seq = run_seq(x0s, tape, model_params)
     jax.block_until_ready(states_seq)
     t_seq = time.perf_counter() - t0
 
@@ -151,8 +151,9 @@ def main():
     _ = run_par(x0s, tape, params_par, max_iter=MAX_ITER)
     jax.block_until_ready(_)
     t0 = time.perf_counter()
-    states_par, iters_per_win, logZ_par = run_par(x0s, tape, params_par,
-                                                  max_iter=MAX_ITER)
+    states_par, iters_per_win, logZ_par, ess_par = run_par(
+        x0s, tape, params_par, max_iter=MAX_ITER
+    )
     jax.block_until_ready(states_par)
     t_par = time.perf_counter() - t0
 
@@ -182,6 +183,10 @@ def main():
     print(f"max |state_par - state_seq|  = {max_diff:.3e}")
     print(f"DEER iters per window  max   = {max_iters}")
     print(f"                       mean  = {mean_iters:.2f}")
+    print(f"ESS / N  (at resample)  seq  min={float(jnp.min(ess_seq))/N:.3f}  "
+          f"mean={float(jnp.mean(ess_seq))/N:.3f}")
+    print(f"                        par  min={float(jnp.min(ess_par))/N:.3f}  "
+          f"mean={float(jnp.mean(ess_par))/N:.3f}")
     print("=" * 72)
 
 
