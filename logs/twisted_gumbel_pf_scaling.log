@@ -1,0 +1,42 @@
+Job 5616038  scc-506  Thu May 14 07:54:53 EDT 2026
+JAX devices: [CudaDevice(id=0)]   L40S
+
+--- LGSSM correctness demo  (T=1024  N=32  K=32) ---
+Sequential : time = 0.0075s    log Z = -1671.2590    RMSE vs Kalman = 0.3162
+Parallel   : time = 0.0029s    log Z = -1671.2590    RMSE vs Kalman = 0.3162
+Speedup    : 2.61x
+Kalman     :                       log Z = -1671.4607
+max |state_par - state_seq|  = 7.153e-07
+DEER iters per window  max   = 2
+                       mean  = 2.00
+
+--- Wall-clock scaling sweep  (N=64  D=1  K=32  tau=1.0) ---
+================================================================================================
+     T    t_seq (s)    t_par (s)   speedup   iters max  iters mean   max |par-seq|
+------------------------------------------------------------------------------------------------
+    128       0.0011       0.0006     1.85x           2        2.00        4.77e-07
+    256       0.0020       0.0009     2.24x           2        2.00        4.77e-07
+    512       0.0038       0.0016     2.38x           2        2.00        7.15e-07
+   1024       0.0075       0.0029     2.62x           2        2.00        7.15e-07
+   2048       0.0151       0.0055     2.75x           2        2.00        7.15e-07
+   4096       0.0276       0.0088     3.12x           2        2.00        9.54e-07
+   8192       0.0556       0.0176     3.16x           2        2.00        9.54e-07
+  16384       0.1115       0.0341     3.27x           2        2.00        9.54e-07
+  32768       0.2194       0.0676     3.25x           2        2.00        9.54e-07
+
+Summary
+-------
+1. Correctness: max |par - seq| stays at machine precision (1e-7 .. 1e-6)
+   across all T. log Z bit-identical.  100% forward-law equivalence.
+
+2. Convergence: DEER iters per window CONSTANT at 2 for every T tested.
+   Compare to the flat per-step Gumbel PF (logs/gumbel_pf_scaling.log)
+   where iters scaled linearly with T (T=1024 -> 716 iters; fails to
+   converge at T>=2048).  The twist + windowing changed iter scaling
+   from O(T) to O(1).
+
+3. Wall-clock: monotonic speedup growing from 1.85x at T=128 to a
+   plateau of ~3.3x for T>=4096.  Plateau is most likely set by the
+   serial scan-over-windows (num_windows = T/K = T/32) becoming a
+   non-trivial share of total cost.  Increasing K should push the
+   plateau higher; that is the next thing to sweep.
