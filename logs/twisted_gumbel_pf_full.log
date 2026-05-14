@@ -1,0 +1,68 @@
+Job 5616364   scc-513   Thu May 14 08:12:23 EDT 2026
+JAX devices: [CudaDevice(id=0)]    L40S
+
+================================================================================
+1. LGSSM correctness demo (T=1024  N=32  K=32  num_windows=32  tau=1.0)
+================================================================================
+Sequential : time = 0.0074s   log Z = -1671.2590   RMSE vs Kalman = 0.3162
+Parallel   : time = 0.0025s   log Z = -1671.2590   RMSE vs Kalman = 0.3162
+Speedup    : 2.92x
+Kalman ref :                  log Z = -1671.4607
+max |state_par - state_seq|     = 7.153e-07
+DEER iters per window  max=2  mean=2.00
+ESS / N  (at resample)  seq    min=0.158  mean=0.525
+                        par    min=0.158  mean=0.525   (matches seq exactly)
+
+================================================================================
+2. LGSSM wall-clock scaling sweep (N=64  K=32)
+================================================================================
+      T    t_seq (s)    t_par (s)   speedup   iters max  iters mean   max |par-seq|
+    128       0.0010       0.0005     2.13x           2        2.00        4.77e-07
+    256       0.0020       0.0007     2.65x           2        2.00        4.77e-07
+    512       0.0034       0.0013     2.61x           2        2.00        7.15e-07
+   1024       0.0065       0.0025     2.58x           2        2.00        7.15e-07
+   2048       0.0127       0.0047     2.72x           2        2.00        7.15e-07
+   4096       0.0252       0.0095     2.65x           2        2.00        9.54e-07
+   8192       0.0503       0.0189     2.66x           2        2.00        9.54e-07
+  16384       0.0998       0.0372     2.68x           2        2.00        9.54e-07
+  32768       0.1986       0.0735     2.70x           2        2.00        9.54e-07
+
+================================================================================
+3. Stochastic-volatility stress test (T=1024  N=64  K=32)
+================================================================================
+SV model: phi=0.95  sigma_q=0.2  beta=1.0
+Observation y_t = beta * exp(x_t / 2) * eta_t, eta_t ~ N(0,1) — non-Gaussian.
+
+--- approx-BIF twist (10 iters of linearised backward info filter) ---
+Seq : time = 0.0067s   log Z = -1453.240
+Par : time = 0.0026s   log Z = -1453.240    speedup = 2.54x
+max |par - seq|              = 5.960e-07
+DEER iters per window  max=2  mean=2.00
+ESS/N  seq  min=0.071  mean=0.427   frac<0.5 = 0.594
+ESS/N  par  min=0.071  mean=0.427   (matches seq exactly)
+
+--- flat twist (mean=0, var=100  --  ~bootstrap proposal) ---
+Seq : time = 0.0068s   log Z = -1455.189
+Par : time = 0.0026s   log Z = -1455.189    speedup = 2.62x
+max |par - seq|              = 1.431e-06
+DEER iters per window  max=2  mean=2.00
+ESS/N  seq  min=0.037  mean=0.178   frac<0.5 = 1.000
+ESS/N  par  min=0.037  mean=0.178
+
+================================================================================
+Headline takeaways
+================================================================================
+1. Forward law equivalence holds on a NONLINEAR model regardless of ESS
+   level. flat-twist SV has every window dipping below 0.5N (some windows
+   ESS/N < 0.04) and still max|par-seq| ~ 1e-6.
+
+2. DEER iters per window stays CONSTANT at 2 across T=128..32768, across
+   LGSSM and SV, across good and bad twists. The windowing reduced the
+   genealogy-coupling problem to T/K events that DEER doesn't see.
+
+3. Speedup plateaus ~2.7x on LGSSM scaling and ~2.5x on SV. The plateau is
+   the serial scan-over-windows; bumping K is the next sweep.
+
+4. log Z agreement is exact to ~6 significant digits (e.g. SV: seq=par
+   to the printed 4 decimals).  ESS estimates agree exactly between
+   seq and par.

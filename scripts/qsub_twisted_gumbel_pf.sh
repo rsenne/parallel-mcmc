@@ -45,6 +45,10 @@ echo
 echo "--- Wall-clock scaling sweep ---"
 PYTHONUNBUFFERED=1 uv run python -u examples/run_twisted_gumbel_pf_scaling.py
 
+echo
+echo "--- Stochastic-volatility stress test (T=1024) ---"
+PYTHONUNBUFFERED=1 uv run python -u examples/run_twisted_gumbel_pf_stochvol.py
+
 echo "=========================================="
 echo "Finished:  $(date)"
 echo "=========================================="
