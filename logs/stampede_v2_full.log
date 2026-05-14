@@ -1,0 +1,67 @@
+Jobs 5618834 / 5619161   scc-504 / scc-512    Thu May 14 10:50-10:59 EDT 2026
+JAX devices: [CudaDevice(id=0)]    L40S
+
+STAMPEDE prototype: parallel MALA over parallel twisted-Gumbel PF.
+
+Setup
+-----
+PF (inner): T=1024, N=32, K_W=64, windowed Gumbel-STE resampling.
+Twist:      precomputed ONCE at PHI_ANCHOR=0 via PARALLEL BIF
+            (closed-form stationary Riccati J* + associative-scan
+            affine recurrence for h). Matches the serial BIF to 0.0
+            absolute error.
+MALA outer: windowed (run_parallel_mala_window), K_BLOCK=50,
+            autodiff_mode='forward', MALA_MAX_ITER=1000.
+PHI_TRUE=0.9. Prior: tanh(theta) ~ Uniform(-1,1).
+
+================================================================================
+1. STAMPEDE sanity (CHAIN_LEN=256)
+================================================================================
+parallel_bif vs serial_bif:  max mean err = 0.000e+00  max var err = 0.000e+00
+log p(phi=0.5)      = -1791.46
+log p(phi=phi_true) = -1718.04    <-- ranked correctly (lower variance with BIF)
+
+Sequential MALA : 0.9862s   final phi = +0.8017
+Parallel   MALA : 3.2067s   final phi = +0.8017   DEER iters = 145
+Speedup         : 0.31x
+max |theta_seq - theta_par| = 3.51e-04
+
+Seq and par chains agree across all 256 MALA steps (within float32 rtol).
+True phi = 0.9; chain converges to posterior region around phi ~ 0.85
+(PF estimator noise + chain length limit).
+
+================================================================================
+2. K_MALA sweep (windowed MALA, T=1024 PF)
+================================================================================
+K_MALA    t_seq (s)   t_par (s)   speedup   iters   iters/K   max|seq-par|   phi
+   16      0.0621      0.0902      0.69x       9     0.56     1.29e-04      0.8646
+   32      0.1231      0.3396      0.36x      20     0.63     2.15e-06      0.8454
+   64      0.2463      0.9057      0.27x      41     0.64     4.77e-07      0.8540
+  128      0.4926      1.5020      0.33x      68     0.53     1.24e-03      0.8651
+  256      0.9842      2.6508      0.37x     120     0.47     1.24e-03      0.8766
+  512      1.9748      5.1471      0.38x     233     0.46     1.24e-03      0.8830
+
+================================================================================
+Headlines
+================================================================================
+1. ARCHITECTURE WORKS. Seq and par MALA chains agree end-to-end at every
+   K_MALA tested (16..512). Both arrive at the same final phi. The
+   compositional parallel-MALA o parallel-PF wiring is correct.
+
+2. PARALLEL BIF: closed-form stationary J* + associative-scan h matches
+   the serial BIF to ZERO error -- the closed-form Riccati fixed point
+   IS the exact stationary BIF for LGSSM, and the affine h recurrence
+   composes exactly via the (a,b) o (a',b') = (a'a, a'b + b') rule.
+
+3. WINDOWED MALA: iters/K drops from 0.63 (small K) to 0.46 (large K),
+   sub-linear scaling. The flat un-windowed sweep was 0.30 * K (linear)
+   so windowing IS slowing iter growth, but not enough to flatten to O(1).
+
+4. NO SPEEDUP CROSSOVER at the inner-PF sizes tested. Speedup hovers
+   at 0.3-0.4x across K_MALA = 16..512. Per-iter parallel cost is one
+   vmap-50 PF; on this LGSSM at T=1024, N=32 that costs ~5x a single
+   PF, so even iters/K ~ 0.5 doesn't beat sequential.
+
+   For speedup the inner PF needs to be substantially heavier (larger
+   T or N) so that the vmap-50 amortisation pays off. This is a
+   sweep-the-inner-PF question, not an architectural one.

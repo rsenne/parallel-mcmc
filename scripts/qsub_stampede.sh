@@ -33,7 +33,12 @@ export LD_LIBRARY_PATH="${NVIDIA_LIB}:${LD_LIBRARY_PATH}"
 PYTHONUNBUFFERED=1 uv run python -c "import jax; print('JAX devices:', jax.devices())"
 
 echo
+echo "--- STAMPEDE sanity (T=1024, K_MALA=32) ---"
 PYTHONUNBUFFERED=1 uv run python -u examples/run_stampede_lgssm.py
+
+echo
+echo "--- STAMPEDE K_MALA sweep ---"
+PYTHONUNBUFFERED=1 uv run python -u examples/run_stampede_K_MALA_sweep.py
 
 echo "=========================================="
 echo "Finished:  $(date)"

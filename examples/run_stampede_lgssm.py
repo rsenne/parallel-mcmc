@@ -60,13 +60,82 @@ TAU = 1.0
 PF_MAX_ITER = 100
 
 # --- MALA (outer) ---
-D_PARAM      = 1
-CHAIN_LEN    = 32
-STEP_SIZE    = 5e-3
-MALA_MAX_ITER = 200
+D_PARAM       = 1
+CHAIN_LEN     = 256
+STEP_SIZE     = 5e-3
+MALA_MAX_ITER = 1000
+MALA_K_BLOCK  = 50          # windowed MALA block size (memory: ~50 is sweet spot)
+PHI_ANCHOR    = 0.0         # anchor for the twist; NOT using PHI_TRUE
 
 
 # ---- twisted-PF step / log-weight (LGSSM, diagonal twist) ----
+
+def backward_information_filter_1d(ys, phi, sigma_q, sigma_r):
+    """Serial RTS-optimal BIF for the 1D LGSSM. Kept as a reference for
+    parallel_bif_1d's correctness check."""
+    prec_obs = 1.0 / sigma_r**2
+    sq = sigma_q**2
+    def step(carry, y):
+        J, h = carry
+        denom = 1.0 + sq * J
+        J_new = phi**2 * J / denom + prec_obs
+        h_new = phi * h / denom + y * prec_obs
+        return (J_new, h_new), (J_new, h_new)
+    J_T = prec_obs
+    h_T = ys[-1] * prec_obs
+    _, (Js_rev, hs_rev) = jax.lax.scan(step, (J_T, h_T), ys[-2::-1])
+    Js = jnp.concatenate([Js_rev[::-1], jnp.array([J_T])])
+    hs = jnp.concatenate([hs_rev[::-1], jnp.array([h_T])])
+    return hs / Js, 1.0 / Js
+
+
+def parallel_bif_1d(ys, phi, sigma_q, sigma_r):
+    """Parallel BIF for the 1D LGSSM in O(log T) depth.
+
+    For stationary (phi, sigma_q, sigma_r) the Riccati update on J has a
+    closed-form fixed point J* (positive root of a quadratic):
+
+        sq * J*^2 + (1 - phi^2 - sq * prec_obs) * J* - prec_obs = 0
+
+    Away from the t=T boundary the BIF J value decays into J* exponentially
+    fast, so using J_t = J* everywhere is an excellent approximation. With
+    J constant, the h recursion
+
+        h_{t-1} = alpha * h_t + y_{t-1} * prec_obs,   alpha = phi / (1 + sq*J*)
+
+    is a 1D affine recurrence with constant coefficient -- solvable in
+    O(log T) depth via jax.lax.associative_scan with the affine
+    composition (a,b) o (a',b') = (a'a, a'b + b').
+    """
+    T = ys.shape[0]
+    prec_obs = 1.0 / sigma_r**2
+    sq = sigma_q**2
+
+    # Closed-form stationary Riccati J*.
+    b = 1.0 - phi**2 - sq * prec_obs
+    J_star = (-b + jnp.sqrt(b**2 + 4.0 * sq * prec_obs)) / (2.0 * sq)
+    alpha = phi / (1.0 + sq * J_star)
+
+    # Affine associative scan to recover h_t = sum_{k>=t} alpha^{k-t} y_k prec_obs.
+    # Steps applied in backward-time order: t = T-1, T-2, ..., 0.
+    # Each step is the affine map (a_step, b_step) = (alpha, y_t * prec_obs)
+    # acting on the running h (starting from h=0). After scanning, the
+    # cumulative affine at scan position k, applied to h=0, gives h_{T-1-k}.
+    alphas    = jnp.full(T, alpha)
+    betas_rev = ys[::-1] * prec_obs
+
+    def compose(left, right):
+        a_l, b_l = left
+        a_r, b_r = right
+        return (a_r * a_l, a_r * b_l + b_r)
+
+    _, cum_betas = jax.lax.associative_scan(compose, (alphas, betas_rev))
+    hs = cum_betas[::-1]                   # h_0, h_1, ..., h_{T-1}
+
+    twist_means = hs / J_star
+    twist_vars  = jnp.full(T, 1.0 / J_star)
+    return twist_means, twist_vars
+
 
 def twisted_step_fn(x_prev, driver, params):
     obs, noise, twist = driver
@@ -100,8 +169,12 @@ def log_weight_fn(x_prev, x_next, obs, twist, params):
 # which makes the sequential-vs-parallel MALA comparison crisp.
 
 def build_log_prob(tgpf):
+    # Twist is precomputed ONCE (at PHI_ANCHOR) and lives inside tp["tape"].
+    # The PF is unbiased for any valid twist -- anchoring at the wrong phi
+    # only increases variance, not bias. So we keep the BIF out of the hot
+    # path and let log_prob just run the parallel PF at the proposed phi.
     def log_prob(theta, tp):
-        phi = theta[0]
+        phi = jnp.tanh(theta[0])
         model_params = {
             "phi":     phi,
             "sigma_q": SIGMA_Q,
@@ -109,12 +182,12 @@ def build_log_prob(tgpf):
             "tau":     TAU,
             "key":     tp["deer_key"],
         }
-        # tgpf.run_parallel -> parallel-in-time PF; log_Z = log p(y | phi)
         _, _, log_Z, _ = tgpf.run_parallel(
             tp["x0s"], tp["tape"], model_params, max_iter=PF_MAX_ITER
         )
-        log_prior = -0.5 * phi**2          # standard normal prior on phi
-        return log_Z + log_prior
+        # Uniform(-1, 1) prior on phi -> log-jacobian in theta-space.
+        log_jac = jnp.log(1.0 - phi**2 + 1e-12)
+        return log_Z + log_jac
     return log_prob
 
 
@@ -135,15 +208,22 @@ def main():
         sim_step, x0, (jr.normal(k_data2, (T,)), jr.normal(k_data3, (T,)))
     )
 
-    # --- build a flat twist (~bootstrap) so log_prob doesn't depend on phi
-    # through the twist init.  All phi-dependence flows through the PF
-    # transition itself.
+    # Precompute the BIF twist ONCE at PHI_ANCHOR=0 via the PARALLEL BIF
+    # (closed-form Riccati J* + associative-scan affine recurrence for h).
+    # Cross-check vs the serial BIF for correctness.
+    twist_means, twist_vars = parallel_bif_1d(ys, PHI_ANCHOR, SIGMA_Q, SIGMA_R)
+    twist_means_ref, twist_vars_ref = backward_information_filter_1d(
+        ys, PHI_ANCHOR, SIGMA_Q, SIGMA_R
+    )
+    bif_mean_err = float(jnp.max(jnp.abs(twist_means - twist_means_ref)))
+    bif_var_err  = float(jnp.max(jnp.abs(twist_vars  - twist_vars_ref)))
+    print(f"  parallel_bif vs serial_bif:  max mean err = {bif_mean_err:.3e}  "
+          f"max var err = {bif_var_err:.3e}")
     twist_params = {
-        "mean":      jnp.zeros((T, 1)),
-        "log_scale": jnp.full((T, 1), 0.5 * jnp.log(100.0)),  # var=100
+        "mean":      twist_means[:, None],
+        "log_scale": 0.5 * jnp.log(twist_vars)[:, None],
     }
 
-    # --- build TwistedGumbelParticleFilter and a fixed tape ---
     tgpf = TwistedGumbelParticleFilter(twisted_step_fn, log_weight_fn,
                                        D=1, tau=TAU)
     key, tape_key, x0s_key, deer_key = jr.split(key, 4)
@@ -158,8 +238,10 @@ def main():
     log_prob = build_log_prob(tgpf)
 
     # --- one-off correctness probe of log_prob ---
-    lp0 = log_prob(jnp.array([0.5]), target_params)
-    lp1 = log_prob(jnp.array([PHI_TRUE]), target_params)
+    theta_05    = jnp.atanh(jnp.array([0.5]))
+    theta_true  = jnp.atanh(jnp.array([PHI_TRUE]))
+    lp0 = log_prob(theta_05, target_params)
+    lp1 = log_prob(theta_true, target_params)
     print(f"  log p(phi=0.5)       = {float(lp0):+.4f}")
     print(f"  log p(phi=phi_true)  = {float(lp1):+.4f}   "
           f"(should be the higher one)")
@@ -168,9 +250,13 @@ def main():
     # autodiff_mode='forward' is REQUIRED because log_prob contains
     # jax.lax.while_loop (inside qdeer.seq1d) which reverse-mode autodiff
     # cannot handle.
+    # window_size=MALA_K_BLOCK -> use run_parallel_mala_window, which
+    # solves the chain in chunks via windowed_qdeer. Iters/window stays
+    # O(1) rather than scaling with the full chain length.
     sampler = samplers.ParallelMALA(
         log_prob, D_PARAM, CHAIN_LEN, MALA_MAX_ITER,
         autodiff_mode="forward",
+        window_size=MALA_K_BLOCK,
     )
 
     key, mala_key, mala_deer_key = jr.split(key, 3)
@@ -191,9 +277,9 @@ def main():
     states_seq.block_until_ready()
     t_seq = time.perf_counter() - t0
 
-    # --- parallel MALA ---
+    # --- parallel MALA (windowed) ---
     yinit_guess = jnp.tile(initial_state[None, :], (CHAIN_LEN, 1))
-    run_par = jax.jit(sampler.run_parallel_mala)
+    run_par = jax.jit(sampler.run_parallel_mala_window)
     _ = run_par(mala_key, initial_state, yinit_guess, mala_params)  # warmup
     jax.block_until_ready(_)
     t0 = time.perf_counter()
@@ -202,18 +288,19 @@ def main():
     t_par = time.perf_counter() - t0
 
     max_diff = float(jnp.max(jnp.abs(states_seq - states_par)))
-    final_seq = float(states_seq[-1, 0])
-    final_par = float(states_par[-1, 0])
+    # Chains are in theta-space; report phi = tanh(theta) for interpretability.
+    phis_seq = jnp.tanh(states_seq[:, 0])
+    phis_par = jnp.tanh(states_par[:, 0])
 
     print("=" * 72)
-    print(f"Sequential MALA : time = {t_seq:.4f}s   final phi = {final_seq:+.4f}")
-    print(f"Parallel   MALA : time = {t_par:.4f}s   final phi = {final_par:+.4f}   "
+    print(f"Sequential MALA : time = {t_seq:.4f}s   final phi = {float(phis_seq[-1]):+.4f}")
+    print(f"Parallel   MALA : time = {t_par:.4f}s   final phi = {float(phis_par[-1]):+.4f}   "
           f"DEER iters = {int(iters)}")
     print(f"Speedup         : {t_seq / t_par:.2f}x")
-    print(f"max |seq - par| = {max_diff:.3e}")
-    print(f"true phi        = {PHI_TRUE:+.4f}")
-    print(f"chain trajectory (seq):  {[round(float(s[0]), 4) for s in states_seq]}")
-    print(f"chain trajectory (par):  {[round(float(s[0]), 4) for s in states_par]}")
+    print(f"max |theta_seq - theta_par| = {max_diff:.3e}")
+    print(f"true phi                    = {PHI_TRUE:+.4f}")
+    print(f"chain phi (seq):  {[round(float(p), 4) for p in phis_seq]}")
+    print(f"chain phi (par):  {[round(float(p), 4) for p in phis_par]}")
 
 
 if __name__ == "__main__":
