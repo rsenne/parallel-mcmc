@@ -1,0 +1,65 @@
+Job 5617250   scc-501   Thu May 14 09:09:54 EDT 2026
+JAX devices: [CudaDevice(id=0)]    L40S
+
+EKF smoother RMSE = 0.6822
+
+--- Adam training of full-cov twist (1500 steps, T=2048) ---
+step  100  neg-ELBO = 10851.43
+step  500  neg-ELBO = 10246.77
+step 1000  neg-ELBO = 10147.78
+step 1500  neg-ELBO = 10133.38   (training time: 520.9s on L40S)
+
+================================================================================
+K-sweep: EKF-init full-cov twist (T=2048, N=64)   [baseline]
+================================================================================
+    K   num_w    t_seq (s)    t_par (s)   speedup   iters max   max|par-seq|   ESS/N min  ESS/N mean
+   16     128       0.1594       0.0958     1.66x          11       1.04e+00       0.016       0.102
+   32      64       0.1525       0.0552     2.76x          12       1.32e+00       0.017       0.068
+   64      32       0.1484       0.0315     4.71x          12       6.96e-03       0.016       0.042
+  128      16       0.1494       0.0188     7.93x          12       9.93e-01       0.016       0.035
+  256       8       0.1487       0.0107    13.94x          12       7.60e-04       0.016       0.024
+  512       4       0.1467       0.0064    23.09x          12       5.21e-04       0.016       0.024
+ 1024       2       0.1511       0.0043    35.37x          12       4.41e-04       0.016       0.024
+ 2048       1       0.1462       0.0026    55.54x          12       4.05e-04       0.016       0.016
+
+================================================================================
+K-sweep: learned full-cov twist (T=2048, N=64)
+================================================================================
+    K   num_w    t_seq (s)    t_par (s)   speedup   iters max   max|par-seq|   ESS/N min  ESS/N mean
+   16     128       0.1594       0.1281     1.24x          13       2.82e+00       0.016       0.029
+   32      64       0.1525       0.0882     1.73x          19       1.98e+00       0.016       0.023
+   64      32       0.1483       0.0840     1.76x          58       2.01e+00       0.016       0.017
+  128      16       0.1470       0.0918     1.60x         118       2.01e-02       0.016       0.018
+  256       8       0.1496       0.1295     1.15x         200       1.00e+08       0.016       0.016  *** DIVERGED
+  512       4       0.1467       0.0940     1.56x         200       1.00e+08       0.016       0.018  *** DIVERGED
+ 1024       2       0.1513       0.0636     2.38x         200       1.00e+08       0.016       0.016  *** DIVERGED
+ 2048       1       0.1471       0.0386     3.81x         200       1.00e+08       0.016       0.016  *** DIVERGED
+
+================================================================================
+Headlines
+================================================================================
+1. FULL COVARIANCE WAS THE FIX for Lorenz63, not training.
+   Switching from diagonal EBIF twist (yesterday) to EKF-init FULL-COV
+   twist (today, NO training) jumps from 16.4x -> 55.5x at K=2048 and
+   drops DEER iters/window from 16 to 12.
+
+2. Training the twist via Adam on the no-resampling ELBO REGRESSES
+   the parallel deployment. neg-ELBO improves (training does its job)
+   but DEER iters explode (58 at K=64) and then DEER diverges
+   outright at K>=256 (max|par-seq|=1e8, hit MAX_ITER=200).
+
+3. Diagnosis: the learned twist sharpens the proposal, making the
+   effective per-step Jacobian stiffer / pushing its spectrum into
+   complex eigenvalues that the diagonal Hutchinson Jacobian
+   estimator in qdeer.seq1d cannot resolve. This matches the
+   feedback memory feedback_deer_damp_complex_eigvals.md:
+     Learned twist eff-Jacobian can have complex eigvals;
+     drop Schur basis + damp=0.95
+   The existing TwistedParallelParticleFilter Lorenz demo deploys
+   the same learned twist with Schur basis rotation + damp=0.95
+   for exactly this reason; I omitted both in the prototype.
+
+4. Next step: add basis (Schur) and damp_factor passthrough to
+   TwistedGumbelParticleFilter.run_parallel, retry K-sweep on the
+   learned twist. Expect speedup with learned twist to match or beat
+   the EKF baseline once the stiffness is handled.
