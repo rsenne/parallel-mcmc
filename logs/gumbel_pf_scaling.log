@@ -1,0 +1,52 @@
+Device: [CudaDevice(id=0)]    N=32  D=1  tau=1.0  damp=0.5
+====================================================================================
+     T    t_seq (s)    t_par (s)   speedup   iters   max |par-seq|
+------------------------------------------------------------------------------------
+   128       0.0021       0.0119     0.17x     111        1.08e-05
+   256       0.0042       0.0223     0.19x     168        1.50e-04
+   512       0.0075       0.3542     0.02x     364        7.99e-06
+  1024       0.0118       4.9031     0.00x     716        2.34e-05
+  2048       0.0227      18.0033     0.00x    1000        2.45e+00   *** hit max_iter
+  4096       0.0430      39.7025     0.00x    1000        3.10e+00   *** hit max_iter
+  8192       0.0907      85.8621     0.00x    1000        3.40e+00   *** hit max_iter
+ 16384       0.2335     179.0502     0.00x    1000        3.23e+00   *** hit max_iter
+
+Hardware: L40S (CUDA 12.x), single-card.
+
+Summary
+-------
+Correctness when DEER converges: max |par - seq| in {1e-6 ... 1.5e-4} for T <= 1024.
+Iterations scale roughly LINEARLY with T:
+    T   iters
+    128  111
+    256  168
+    512  364
+   1024  716
+Past T=1024 the solver hits max_iter=1000 and the trajectory has not
+converged (state error ~ 2-3 in absolute value at convergence boundary
+particles).
+
+No wall-clock speedup at any T.  At T=128 the parallel solver is already
+~6x slower than sequential; ratio worsens with T.
+
+Diagnosis
+---------
+Linear iters-vs-T scaling means each DEER Newton step propagates ancestor
+information by only O(1) timesteps.  This is the genealogy chain being
+fundamentally serial: when a child ancestor flips at time t, the
+downstream trajectory must re-thread, and the soft Gumbel-Softmax
+surrogate's gradient is only locally accurate (one flip per step).
+
+This is structurally different from MALA accept/reject: MALA's discrete
+decision is local to a single chain (which value to keep) and does not
+change the chain's identity; PF resampling changes child particle
+identity, coupling all particles.  The soft Jacobian smears the
+coupling but does not collapse it into log T parallel work.
+
+Implication for next iteration
+------------------------------
+Construct must avoid resampling at most timesteps.  Twisted SMC keeps
+ESS high so resampling triggers rarely; combining twisted-PF with
+Gumbel-STE resampling at occasional checkpoints isolates the discrete
+events to a small number of timesteps, while between checkpoints each
+particle's chain is smooth and DEER-friendly.
