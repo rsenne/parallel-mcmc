@@ -244,7 +244,7 @@ def time_min(fn, *args, repeat=3):
 
 # -------- K-sweep --------
 
-def K_sweep(twist_params, x0s, ys, key, label):
+def K_sweep(twist_params, x0s, ys, key, label, damp_factor=1.0):
     print(f"\n--- K-sweep: {label} ---")
     print("=" * 105)
     print(f"{'K':>5}  {'num_w':>6}  {'t_seq (s)':>11}  {'t_par (s)':>11}  "
@@ -268,7 +268,8 @@ def K_sweep(twist_params, x0s, ys, key, label):
 
         t_seq, (states_seq, _, _, ess_seq) = time_min(run_seq, x0s, tape, model_params)
         t_par, (states_par, iters, _, ess_par) = time_min(
-            lambda x0_, t_, p_: run_par(x0_, t_, p_, max_iter=MAX_ITER),
+            lambda x0_, t_, p_: run_par(x0_, t_, p_, max_iter=MAX_ITER,
+                                        damp_factor=damp_factor),
             x0s, tape, params_par,
         )
         err = float(jnp.max(jnp.abs(states_par - states_seq)))
@@ -351,14 +352,18 @@ def main():
     K_sweep(twist_ekf, x0s, ys, jr.PRNGKey(7),
             f"EKF-init full-cov twist (T={T}, N={N})  [baseline]")
 
-    # K-sweep with learned twist
+    # K-sweep with learned twist, at several Newton damping levels.
+    # damp_factor=1.0 reproduces the K>=256 divergence (complex eigvals in
+    # the learned twist's effective Jacobian); damped runs test the rescue.
     twist_learned = {
         "mean":          twist_mean,
         "chol_log_diag": twist_log_diag,
         "chol_offdiag":  twist_offdiag,
     }
-    K_sweep(twist_learned, x0s, ys, jr.PRNGKey(7),
-            f"learned full-cov twist (T={T}, N={N})")
+    for damp in (1.0, 0.95, 0.9, 0.8):
+        K_sweep(twist_learned, x0s, ys, jr.PRNGKey(7),
+                f"learned full-cov twist (T={T}, N={N}, damp={damp})",
+                damp_factor=damp)
 
 
 if __name__ == "__main__":

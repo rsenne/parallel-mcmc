@@ -635,73 +635,127 @@ print(f"{'='*70}")
 
 
 # Use the best parallel result for plotting
-best_par_means = mean_ekf_par
-best_speedup   = t_ekf_seq / t_ekf_par
-best_iters     = deer_iters_ekf
+best_par_means = mean_learn_par
+best_speedup   = t_learn_seq / t_learn_par
+best_iters     = deer_iters_learn
 
-fig = plt.figure(figsize=(16, 10))
-t_idx = jnp.arange(T)
+# Dump everything the paper compose script needs into a single npz cache.
+# Trajectories are seed-deterministic; timings reflect the device this ran on.
+import numpy as _np_dump
+_np_dump.savez(
+    "examples/figures/_lorenz63_cache.npz",
+    true_xs        = _np_dump.asarray(true_xs),
+    ys             = _np_dump.asarray(ys),
+    ekf_means      = _np_dump.asarray(ekf_means),
+    bpf_filt_means = _np_dump.asarray(bpf_filt_means),
+    bps_means      = _np_dump.asarray(bps_means),
+    mean_ekf_par   = _np_dump.asarray(mean_ekf_par),
+    mean_learn_par = _np_dump.asarray(mean_learn_par),
+    rmses          = _np_dump.asarray([
+        ekf_rmse, rmse_bpf_filt, rmse_bps,
+        rmse_ekf_seq, rmse_ekf_par,
+        rmse_learn_seq, rmse_learn_par,
+    ]),
+    times          = _np_dump.asarray([
+        _np_dump.nan, t_bpf, t_bps,
+        t_ekf_seq, t_ekf_par,
+        t_learn_seq, t_learn_par,
+    ]),
+    deer_iters     = _np_dump.asarray([
+        -1, -1, -1,
+        -1, deer_iters_ekf,
+        -1, deer_iters_learn,
+    ]),
+    method_names   = _np_dump.array([
+        "EKF smoother", "Bootstrap PF", "FFBSi",
+        "EKF twist (seq)", "EKF twist (par)",
+        "Learned twist (seq)", "Learned twist (par)",
+    ]),
+)
+
+# Apply shared paper style
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(__file__), "figures"))
+import paper_style as ps  # noqa: E402
+ps.apply()
+
+import numpy as _np
+
+t_idx = _np.arange(T)
 dim_names = ['x', 'y', 'z']
 
-# Row 1: three state dimensions
-for d in range(3):
-    ax = fig.add_subplot(3, 3, d + 1)
-    ax.plot(t_idx, true_xs[:, d], 'k-', lw=1, alpha=0.7, label='true')
-    ax.plot(t_idx, ekf_means[:, d], 'g-', lw=0.8, alpha=0.6, label='EKF')
-    ax.plot(t_idx, best_par_means[:, d], 'r-', lw=0.8, alpha=0.8,
-            label='parallel PF')
-    ax.set_ylabel(f'${dim_names[d]}$')
-    if d == 0:
-        ax.legend(fontsize=8)
-    ax.set_title(f'State ${dim_names[d]}$')
-    ax.grid(True, alpha=0.3)
+# Pick a representative window for the zoomed trajectory panel
+WIN = slice(800, 1100)
 
-# Row 2: loss curve, per-step ESS, 3D attractor
-ax = fig.add_subplot(3, 3, 4)
-ax.plot(losses, 'b-', lw=1)
-ax.set_xlabel('Step')
-ax.set_ylabel('Neg-ELBO')
-ax.set_title('Twist learning')
-ax.grid(True, alpha=0.3)
+fig = plt.figure(figsize=(ps.COL_FULL, 5.0), constrained_layout=True)
+gs = fig.add_gridspec(2, 2, height_ratios=[1.05, 0.95],
+                      width_ratios=[1.0, 1.05])
 
-ax = fig.add_subplot(3, 3, 5)
-ax.plot(t_idx, ess_per_step, 'b-', lw=0.8)
-ax.axhline(N, color='k', ls='--', lw=0.5, label=f'N={N}')
-ax.set_xlabel('Timestep')
-ax.set_ylabel('ESS')
-ax.set_title(f'Per-step ESS (mean={mean_ess:.0f})')
-ax.legend(fontsize=8)
-ax.grid(True, alpha=0.3)
+# (a) 3D attractor — the strongest visual hook, top-left
+ax3d = fig.add_subplot(gs[0, 0], projection='3d')
+ax3d.plot(true_xs[:, 0], true_xs[:, 1], true_xs[:, 2],
+          color='black', lw=0.4, alpha=0.55, label='true')
+ax3d.plot(best_par_means[:, 0], best_par_means[:, 1], best_par_means[:, 2],
+          color=ps.PALETTE['par'], lw=0.5, alpha=0.85, label='parallel PF')
+ax3d.set_xlabel('$x$', labelpad=-2)
+ax3d.set_ylabel('$y$', labelpad=-2)
+ax3d.set_zlabel('$z$', labelpad=-2)
+ax3d.set_title('Lorenz-63 attractor')
+ax3d.legend(loc='upper left', fontsize=7)
+ax3d.tick_params(labelsize=6)
 
-ax = fig.add_subplot(3, 3, 6, projection='3d')
-ax.plot(true_xs[:, 0], true_xs[:, 1], true_xs[:, 2],
-        'k-', lw=0.5, alpha=0.5, label='true')
-ax.plot(best_par_means[:, 0], best_par_means[:, 1], best_par_means[:, 2],
-        'r-', lw=0.5, alpha=0.7, label='parallel PF')
-ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('z')
-ax.set_title('Lorenz attractor')
-ax.legend(fontsize=8)
+# (b) Zoomed state-x trajectory — actually legible at this scale
+ax_traj = fig.add_subplot(gs[0, 1])
+ax_traj.plot(t_idx[WIN], true_xs[WIN, 0], color='black', lw=1.0,
+             alpha=0.85, label='true')
+ax_traj.plot(t_idx[WIN], ekf_means[WIN, 0],
+             color=ps.PALETTE['twisted_seq'], lw=1.0, alpha=0.8,
+             label='EKF smoother')
+ax_traj.plot(t_idx[WIN], best_par_means[WIN, 0],
+             color=ps.PALETTE['par'], lw=1.0, alpha=0.9,
+             label='parallel PF')
+ax_traj.set_xlabel('Timestep')
+ax_traj.set_ylabel('$x_t$')
+ax_traj.set_title(f'State $x$ (window {WIN.start}--{WIN.stop})')
+ax_traj.legend(loc='upper right', fontsize=7, ncol=3,
+               columnspacing=0.8, handlelength=1.2)
 
-# Row 3: twist means vs true for each dimension
-for d in range(3):
-    ax = fig.add_subplot(3, 3, 7 + d)
-    ax.plot(t_idx, true_xs[:, d], 'k-', lw=1, alpha=0.7, label='true')
-    ax.plot(t_idx, ekf_means[:, d], 'g-', lw=0.8, alpha=0.5, label='EKF mean')
-    ax.plot(t_idx, twist_mean[:, d], 'r-', lw=0.8, alpha=0.7, label='learned twist')
-    scale = jnp.exp(twist_log_diag[:, d])
-    ax.fill_between(t_idx, twist_mean[:, d] - scale,
-                    twist_mean[:, d] + scale, color='r', alpha=0.1)
-    ax.set_xlabel('Timestep')
-    ax.set_title(f'Learned twist ${dim_names[d]}$')
-    if d == 0:
-        ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
+# (c) ELBO learning curve
+ax_loss = fig.add_subplot(gs[1, 0])
+ax_loss.plot(losses, color=ps.PALETTE['par_alt'], lw=1.0)
+ax_loss.set_xlabel('Adam step')
+ax_loss.set_ylabel('Neg-ELBO')
+ax_loss.set_title('Twist training')
 
-plt.suptitle(
-    f'Lorenz-63 parallel particle smoother — T={T}, D={D}, N={N}, '
-    f'{best_iters} DEER iters, {best_speedup:.0f}x speedup',
-    fontsize=13, y=1.01,
+# (d) Method-comparison RMSE bars — ties the figure to the L63 table
+methods = ['Bootstrap\nPF', 'FFBSi', 'EKF twist\n(par)', 'Learned\n(par)']
+rmses   = [rmse_bpf_filt, rmse_bps, rmse_ekf_par, rmse_learn_par]
+times   = [t_bpf, t_bps, t_ekf_par, t_learn_par]
+colors  = [ps.PALETTE['bpf'], ps.PALETTE['ffbsi'],
+           ps.PALETTE['par'], ps.PALETTE['par_alt']]
+ax_rmse = fig.add_subplot(gs[1, 1])
+xpos = _np.arange(len(methods))
+ax_rmse.bar(xpos, rmses, color=colors, edgecolor='k', lw=0.5,
+            alpha=0.88, width=0.65)
+ax_rmse.axhline(ekf_rmse, color='black', ls='--', lw=0.8,
+                label=f'EKF ref. ({ekf_rmse:.2f})')
+ax_rmse.set_xticks(xpos)
+ax_rmse.set_xticklabels(methods, fontsize=7)
+ax_rmse.set_ylabel('RMSE vs.\\ true')
+ax_rmse.set_title('Smoother accuracy')
+ax_rmse.legend(loc='upper right', fontsize=7)
+top = max(rmses) * 1.15
+ax_rmse.set_ylim(0, top)
+for xi, r, tt in zip(xpos, rmses, times):
+    ax_rmse.text(xi, r + top * 0.01, f'{r:.2f}\n{tt*1e3:.0f}\\,ms',
+                 ha='center', va='bottom', fontsize=6.5, color='0.2')
+
+fig.suptitle(
+    f'Lorenz-63 parallel particle smoother — '
+    f'$T{{=}}{T}$, $D{{=}}3$, $N{{=}}{N}$.  '
+    f'Learned full-cov twist: {best_iters} DEER iters, '
+    f'{best_speedup:.1f}$\\times$ speedup, RMSE matches EKF reference.',
+    fontsize=9.5, y=1.03,
 )
-plt.tight_layout()
-plt.savefig('twisted_pf_lorenz63.png', dpi=150, bbox_inches='tight')
-plt.show()
+plt.savefig('twisted_pf_lorenz63.png')
+plt.close(fig)

@@ -23,7 +23,8 @@ class ParallelMALA:
     # our constructor
     def __init__(self, log_prob, dim, chain_length, max_iter, alg="quasi",
                  clip_val=1.0, damp_factor=1.0, full_trace=False,
-                 basis_transformation=False, window_size=None, sigmasq=1e8):
+                 basis_transformation=False, window_size=None, sigmasq=1e8,
+                 autodiff_mode="reverse"):
         '''
         Args:
             logp - unnormalized log-posterior function that ONLY takes in theta as argument. Use partial.
@@ -42,7 +43,24 @@ class ParallelMALA:
         self.log_prob = log_prob
         self.D = dim
         self.chain_length = chain_length
-        self.target_log_prob_and_grad = jax.value_and_grad(self.log_prob)
+        # autodiff_mode="forward" uses jax.jvp instead of jax.value_and_grad,
+        # so the log_prob can contain jax.lax.while_loop (which reverse-mode
+        # cannot differentiate).  Cost: D forward passes per gradient instead
+        # of one fwd+bwd pair.  Worth it when the forward pass is much
+        # cheaper, e.g. parallel-in-time twisted PF inside log_prob.
+        if autodiff_mode == "forward":
+            def _value_and_grad_fwd(theta, target_params):
+                f = lambda t: log_prob(t, target_params)
+                eye = jnp.eye(theta.shape[0], dtype=theta.dtype)
+                pushforward = lambda v: jax.jvp(f, (theta,), (v,))
+                primals, tangents = jax.vmap(pushforward,
+                                              in_axes=0,
+                                              out_axes=(0, 0))(eye)
+                return primals[0], tangents
+            self.target_log_prob_and_grad = _value_and_grad_fwd
+        else:
+            self.target_log_prob_and_grad = jax.value_and_grad(self.log_prob)
+        self.autodiff_mode = autodiff_mode
         self.max_iter = max_iter
         self.alg = alg
         self.clip_val = clip_val
@@ -161,99 +179,3 @@ class ParallelMALA:
         _, out_states = jax.lax.scan(_fxn_for_scan, initial_state, drivers)
 
         return out_states
-
-
-class ParallelHMC:
-    # our constructor
-    def __init__(self, log_prob, dim, chain_length, max_iter, alg="quasi",
-                 clip_val=1.0, damp_factor=1.0, full_trace=False, basis_transformation=False):
-        '''
-        Args:
-            logp - unnormalized log-posterior function that ONLY takes in theta as argument. Use partial.
-            dim - how many dimensions is our parameter space for sampling? (added together)
-            epsilon - the MALA stepsize.
-            quasi - are we taking diagonal or full Jacobian?
-            qmem_efficient - are we using the Hutchinson's estimator?
-            clip_val - what are we clipping individual gradient entries to in absolute value?
-            damp_factor - slightly damping the Jacobian.
-        '''
-        # 1. internalize + get the target log-prob and grad
-        self.log_prob = log_prob
-        self.D = dim
-        self.chain_length = chain_length
-        self.target_log_prob_and_grad = jax.value_and_grad(self.log_prob)
-        self.max_iter = max_iter
-        self.alg = alg 
-        self.clip_val = clip_val
-        self.damp_factor = damp_factor
-        self.full_trace = full_trace 
-        self.basis_transformation = basis_transformation
-
-    def scan_leapfrog(self, state, step_size):
-        # Assumes you start and end 
-        # with half-step corrections to momentum
-        # Add half step before running iteration
-        # Subtract half step after running iteration
-        z, m = jnp.split(state, 2)
-        z += step_size * m
-        _, tlp_grad = self.target_log_prob_and_grad(z)
-        m += step_size * tlp_grad
-        next_state = jnp.concatenate((z, m))
-        return next_state
-
-    def hmc_fxn_for_deer(self, state, driver, params):
-        seed = driver
-        z = state 
-        step_size = params['epsilon'] 
-        m_seed, mh_seed = jax.random.split(seed)
-        tlp, tlp_grad = self.target_log_prob_and_grad(z)
-        m = jax.random.normal(m_seed, z.shape)
-        energy = 0.5 * jnp.square(m).sum() - tlp
-        # start with half-step of momentum
-        m += 0.5 * step_size * tlp_grad
-        init_state = jnp.concatenate((z, m))
-        new_state = jax.lax.fori_loop(0, params['num_leapfrog_steps'],
-            lambda i, state : self.scan_leapfrog(state, step_size), 
-            init_state)
-        new_z, new_m = jnp.split(new_state, 2)
-        new_tlp, new_tlp_grad = self.target_log_prob_and_grad(new_z)
-        # end with backward half-step of momentum
-        new_m -= 0.5 * step_size * new_tlp_grad 
-        new_energy = 0.5 * jnp.square(new_m).sum() - new_tlp
-        log_accept_ratio = energy - new_energy
-
-        # accept-reject
-        u = jax.random.uniform(mh_seed, [])
-        g = sigmoid_accept(log_accept_ratio-jnp.log(u))
-        z = g*new_z + (1.0-g)*z
-        return z
-
-    def run_sequential_hmc(self, key, initial_state, params):
-
-        def _fxn_for_scan(state, driver):
-            state = self.hmc_fxn_for_deer(state, driver, params)
-            return state, state 
-
-        drivers = jr.split(key, (self.chain_length,))
-        _, out_states = jax.lax.scan(_fxn_for_scan, initial_state, drivers)
-
-        return out_states
-
-    def run_parallel_hmc(self, key, initial_state, yinit_guess, params):
-        drivers = jr.split(key, (self.chain_length,))
-
-        # if self.basis_transformation:
-        #     initial_state = params["basis"].T @ initial_state 
-        #     yinit_guess = jnp.einsum('...ij, ...j -> ...i', params["basis"].T, yinit_guess)
-
-        out_states, iters = deer.seq1d(
-            self.hmc_fxn_for_deer, initial_state, drivers, params, 
-            yinit_guess=yinit_guess, max_iter=self.max_iter, 
-            quasi=False, qmem_efficient=False, clip_val=self.clip_val,
-            full_trace=self.full_trace, damp_factor=self.damp_factor
-        )
-
-        # if self.basis_transformation:
-        #     out_states = jnp.einsum('...ij, ...j -> ...i', params["basis"], out_states)
-
-        return out_states, iters 

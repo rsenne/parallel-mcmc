@@ -204,8 +204,8 @@ class GumbelParallelParticleFilter:
         Resampling couples all particles, so the per-step Jacobian is
         dense. The default ``solver='full'`` uses full (D*N, D*N) DEER
         — fine when D*N is modest (≲ a few hundred). For larger systems
-        use ``'quasi'`` (Hutchinson-diagonal) or ``'rank1'`` (Hutchinson
-        rank-1) at the cost of slower convergence.
+        use ``'quasi'`` (Hutchinson-diagonal) at the cost of slower
+        convergence.
 
         Parameters
         ----------
@@ -215,7 +215,7 @@ class GumbelParallelParticleFilter:
                       Hutchinson estimators; harmless for 'full').
         yinit_guess : (T, D*N) DEER warm-start; defaults to zeros.
         max_iter    : maximum DEER Newton iterations.
-        solver      : 'full' | 'quasi' | 'rank1'.
+        solver      : 'full' | 'quasi'.
         **kwargs    : forwarded to the underlying seq1d call (e.g.
                       clip_val, damp_factor, full_trace, num_samples).
 
@@ -246,19 +246,9 @@ class GumbelParallelParticleFilter:
                 max_iter=max_iter,
                 **kwargs,
             )
-        elif solver == "rank1":
-            states, samp_iters = qdeer.seq1d_rank1(
-                self.pf_step,
-                s0,
-                tape,
-                params,
-                yinit_guess=yinit_guess,
-                max_iter=max_iter,
-                **kwargs,
-            )
         else:
             raise ValueError(
-                f"unknown solver={solver!r}; expected 'full', 'quasi', or 'rank1'"
+                f"unknown solver={solver!r}; expected 'full' or 'quasi'"
             )
         return states, samp_iters
 
@@ -423,6 +413,8 @@ class TwistedGumbelParticleFilter:
         mode: str,
         max_iter: int,
         deer_key: jnp.ndarray,
+        damp_factor: float = 1.0,
+        clip_val: float = 1e8,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """Solve one particle's K-step twisted chain. Returns (states (K,D), iters)."""
         particle_tape = (win_obs, win_noise, win_twist)
@@ -439,6 +431,8 @@ class TwistedGumbelParticleFilter:
             return qdeer.seq1d(
                 self.twisted_step_fn, x0, particle_tape, params_i,
                 max_iter=max_iter,
+                damp_factor=damp_factor,
+                clip_val=clip_val,
             )
 
         else:
@@ -451,7 +445,10 @@ class TwistedGumbelParticleFilter:
         params: dict,
         mode: str,
         max_iter: int = 100,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        damp_factor: float = 1.0,
+        clip_val: float = 1e8,
+        return_weights: bool = False,
+    ) -> Tuple[jnp.ndarray, ...]:
         """Common windowed driver — sequential or parallel-per-particle."""
         obs_w, noise_w, twist_w, gumbel_w = tape
         num_windows, K = obs_w.shape[0], obs_w.shape[1]
@@ -475,6 +472,7 @@ class TwistedGumbelParticleFilter:
                 return self._run_one_particle_window(
                     x0, win_obs, noise_i, win_twist, params_clean,
                     mode=mode, max_iter=max_iter, deer_key=key_i,
+                    damp_factor=damp_factor, clip_val=clip_val,
                 )
 
             states_w, iters = jax.vmap(solve_one)(particles, win_noise_all,
@@ -508,7 +506,8 @@ class TwistedGumbelParticleFilter:
             new_particles = X_resamp.T                               # (N, D)
             new_log_w_acc = jnp.zeros_like(log_w_acc)
 
-            return (new_particles, new_log_w_acc), (states_w, iters, log_Z_inc, ess)
+            return (new_particles, new_log_w_acc), (states_w, iters, log_Z_inc,
+                                                    ess, log_ws_w, particles)
 
         init = (x0s, jnp.zeros(N, dtype=x0s.dtype))
         scan_inputs = (
@@ -518,7 +517,8 @@ class TwistedGumbelParticleFilter:
             gumbel_w,
             deer_keys_outer,
         )
-        _, (states_chunks, iters_chunks, logZ_per_window, ess_per_window) = (
+        _, (states_chunks, iters_chunks, logZ_per_window, ess_per_window,
+            logw_chunks, win_x0s) = (
             jax.lax.scan(window_step, init, scan_inputs)
         )
         # states_chunks: (num_windows, N, K, D) -> (N, T, D)
@@ -526,9 +526,17 @@ class TwistedGumbelParticleFilter:
             N, num_windows * K, self.D
         )
         log_Z = jnp.sum(logZ_per_window)
+        if return_weights:
+            # logw_chunks: (num_windows, N, K) -> (N, T) per-step log weights.
+            # win_x0s: (num_windows, N, D) particles at each window start
+            # (post-resampling), i.e. the parent values for the first step
+            # of each window — needed for cross-boundary transition pairs.
+            log_ws = logw_chunks.transpose(1, 0, 2).reshape(N, num_windows * K)
+            return (states, iters_chunks, log_Z, ess_per_window,
+                    log_ws, win_x0s)
         return states, iters_chunks, log_Z, ess_per_window
 
-    def run_sequential(self, x0s, tape, params):
+    def run_sequential(self, x0s, tape, params, return_weights: bool = False):
         """Sequential twisted PF with Gumbel-STE checkpoint resampling.
 
         Returns (states, iters_per_window, log_Z, ess_per_window):
@@ -537,17 +545,27 @@ class TwistedGumbelParticleFilter:
             log_Z           : scalar
             ess_per_window  : (num_windows,) — ESS at each resample point
                               before resampling.
+        With return_weights=True additionally returns
+            log_ws  : (N, T)   per-step incremental log weights
+            win_x0s : (num_windows, N, D) post-resampling window-start
+                      particles (parents of each window's first step).
         """
-        return self._run(x0s, tape, params, mode="sequential")
+        return self._run(x0s, tape, params, mode="sequential",
+                         return_weights=return_weights)
 
-    def run_parallel(self, x0s, tape, params, max_iter: int = 100):
+    def run_parallel(self, x0s, tape, params, max_iter: int = 100,
+                     damp_factor: float = 1.0, clip_val: float = 1e8,
+                     return_weights: bool = False):
         """Parallel-in-time twisted PF: per-window, per-particle DEER.
 
         Each window of K steps is solved by quasi-DEER, vmapped over
         particles. Resampling is applied serially at window boundaries.
 
         params must contain 'key' (used to split per-window DEER keys).
+        damp_factor < 1 damps the Newton step (use ~0.95 for twists whose
+        effective Jacobian has complex eigenvalues, e.g. learned twists).
         Returns (states, iters_per_window, log_Z, ess_per_window).
         """
         return self._run(x0s, tape, params, mode="parallel",
-                         max_iter=max_iter)
+                         max_iter=max_iter, damp_factor=damp_factor,
+                         clip_val=clip_val, return_weights=return_weights)

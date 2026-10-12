@@ -194,7 +194,12 @@ def run_fulljac_tpf(tpf, x0s, tape, params, max_iter=100, damp=1.0):
     return states, iters
 
 
-#  Simulate + run 
+#  Simulate + run
+# N=64 is deliberately small here, not the project-wide default (N=256).
+# Full-Jacobian DEER stores (T, N, D, D) = 2000*N*D^2 floats per particle, so at
+# D=40 the scan tensor is 2000 * 64 * 1600 ≈ 800 MB.  Bumping to N=256 OOMs on
+# a 40 GB GPU at D=40, and the smoothing RMSE story (twisted flat at ~0.3 vs
+# baselines diverging) is *stronger* at small N — so we keep N=64.
 def run_l96(D, T=2000, N=64, dt=0.02, F=8.0, sigma_q=0.2, sigma_r=0.5,
             seed=0, use_damp=1.0):
     key = jr.PRNGKey(seed)

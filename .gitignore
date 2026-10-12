@@ -4,12 +4,27 @@
 uv.lock
 
 # pycaches
-/src/__pycache__
-/examples/__pycache__
+__pycache__/
+
+# cluster job stdout/stderr
+logs/
+
+# local claude session state
+.claude/
 
 #prelim results--to be deleted alter
 results_consolidation
 _lorenz_learned_twist.pkl
 
+# cached twist/EM artifacts (regenerable)
+examples/_*.pkl
+examples/_*.npz
+
 # paper Latex stuff. Delete once ready.
 # paper
+# untracked leftovers parked during the 2026-10-12 cleanup (safe to delete)
+attic/
+
+# result images written by example scripts
+/*.png
+/*.svg

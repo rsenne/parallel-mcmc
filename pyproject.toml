@@ -5,15 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "parallel-mcmc"
 version = "0.1"
-description = "Algorithms for Parallel Evaluation of MCMC Samplers"
+description = "Differentiable, parallel-in-time particle filters (twisted DEER + windowed Gumbel-STE resampling)"
 requires-python = ">=3.11"
 readme = "README.md"
 license = {file="LICENSE"}
 dependencies = [
-    "tensorflow",
-    "tensorflow-probability",
-    "inference_gym",
-    "tensorflow_datasets",
+    "jax",
+    "optax",
+    "numpy",
+    "scipy",
     "matplotlib",
     "jaxtyping"
 ]
